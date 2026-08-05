@@ -1,3 +1,7 @@
+#Open a terminal and run this to download the libraries
+#pip3 install numpy opencv-python ultralytics pyserial
+
+
 """
 posture_monitor.py
 -------------------
