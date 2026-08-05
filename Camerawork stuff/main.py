@@ -71,7 +71,8 @@ class Config:
     # -- Model / capture --
     model_path: str = "yolo26n-pose.pt"
     camera_index: int = 0
-    sample_interval_s: float = 2.5          # process ~1 frame every 2-3s (load optimization)
+    sample_interval_s: float = 1.0          # seconds between AI posture checks
+    model_imgsz: int = 320                  # smaller inference image = faster checks/display
     conf_threshold: float = 0.5             # min keypoint confidence to trust a point
 
     # -- Smoothing --
@@ -273,15 +274,17 @@ class PostureMonitor:
 
         self._last_sample_t = 0.0
         self._last_state = "NEUTRAL"
+        self._last_tracking_points = None
         # small rolling history purely for on-screen debug/plotting if desired
         self._history = deque(maxlen=100)
 
     # ---------------------------------------------------------------- #
     def _extract_angles(self, frame) -> Optional[Tuple[float, float]]:
         """Run pose model on one frame, return (neck_angle, trunk_angle) or None."""
-        results = self.model(frame, verbose=False)[0]
+        results = self.model(frame, verbose=False, imgsz=self.cfg.model_imgsz)[0]
 
         if results.keypoints is None or len(results.keypoints.xy) == 0:
+            self._last_tracking_points = None
             return None
 
         # Use the first detected person (assume single-student desk setup)
@@ -290,9 +293,15 @@ class PostureMonitor:
 
         picked = pick_side(keypoints, confs, self.cfg)
         if picked is None:
+            self._last_tracking_points = None
             return None
 
         ear, shoulder, hip = picked
+        self._last_tracking_points = {
+            "ear": ear,
+            "shoulder": shoulder,
+            "hip": hip,
+        }
 
         neck_angle = angle_from_vertical(ear, shoulder)     # forward head posture
         trunk_angle = angle_from_vertical(shoulder, hip)    # slouch
@@ -309,6 +318,8 @@ class PostureMonitor:
 
     # ---------------------------------------------------------------- #
     def _draw_overlay(self, frame, neck_angle, trunk_angle, state):
+        frame = self._draw_tracking_overlay(frame)
+
         y = 30
         lines = [
             f"State: {state}",
@@ -320,6 +331,42 @@ class PostureMonitor:
         for line in lines:
             cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             y += 25
+        return frame
+
+    # ---------------------------------------------------------------- #
+    def _draw_tracking_overlay(self, frame):
+        """Draw the keypoints and posture vectors used for angle calculation."""
+        if self._last_tracking_points is None:
+            return frame
+
+        ear = tuple(self._last_tracking_points["ear"].astype(int))
+        shoulder = tuple(self._last_tracking_points["shoulder"].astype(int))
+        hip = tuple(self._last_tracking_points["hip"].astype(int))
+
+        cv2.line(frame, shoulder, ear, (255, 180, 0), 3)
+        cv2.line(frame, hip, shoulder, (255, 180, 0), 3)
+
+        vertical_top = (shoulder[0], max(0, shoulder[1] - 90))
+        cv2.line(frame, shoulder, vertical_top, (180, 180, 180), 2)
+
+        points = [
+            ("Ear", ear, (0, 255, 255)),
+            ("Shoulder", shoulder, (255, 0, 255)),
+            ("Hip", hip, (0, 180, 255)),
+        ]
+        for label, point, color in points:
+            cv2.circle(frame, point, 7, color, -1)
+            cv2.circle(frame, point, 10, (0, 0, 0), 2)
+            cv2.putText(
+                frame,
+                label,
+                (point[0] + 10, point[1] - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2,
+            )
+
         return frame
 
     # ---------------------------------------------------------------- #
@@ -393,7 +440,8 @@ def parse_args() -> Config:
     p = argparse.ArgumentParser(description="Posture monitor backend for Stats & Emotion Cube")
     p.add_argument("--model", default="yolo26n-pose.pt")
     p.add_argument("--camera", type=int, default=0)
-    p.add_argument("--interval", type=float, default=2.5, help="Seconds between inference samples")
+    p.add_argument("--interval", type=float, default=1.0, help="Seconds between inference samples")
+    p.add_argument("--imgsz", type=int, default=320, help="YOLO inference image size; lower is faster")
     p.add_argument("--port", type=str, default=None, help="Serial port, e.g. COM5 or /dev/ttyUSB0")
     p.add_argument("--baud", type=int, default=115200)
     args = p.parse_args()
@@ -402,6 +450,7 @@ def parse_args() -> Config:
         model_path=args.model,
         camera_index=args.camera,
         sample_interval_s=args.interval,
+        model_imgsz=args.imgsz,
         serial_port=args.port,
         serial_baud=args.baud,
     )
