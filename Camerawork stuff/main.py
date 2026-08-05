@@ -1,4 +1,29 @@
 """
+Prompt: Act as an expert technical mentor and Python engineer assisting with a pre-university level design challenge (Waterloo Design Challenge).
+### Project Overview
+- Challenge Prompt: "Design a system that helps an individual student monitor and manage their personal comfort in a study environment."
+- Hardware Architecture: 
+  1. A side-view webcam positioned 3–5 ft away at shoulder height to monitor spinal alignment and head posture.
+  2. A desktop "Stats & Emotion Cube" equipped with a screen, running off a microcontroller (e.g., ESP32/Arduino).
+- Software Architecture: A Python backend running on a host laptop using OpenCV and a pre-trained posture detection model (YOLOv8 Pose / yolov8n-pose.pt).
+- Time Constraint: High-urgency build (~2 days remaining).
+### Key Decisions Made So Far
+1. Posture Analytics: Tracking keypoints (Ear, Shoulder, Hip) from a 90° side angle. Forward head posture ("text neck") is measured via the Ear-to-Shoulder vector relative to vertical. Slouching is measured via the Shoulder-to-Hip vector.
+2. Hardware Load Optimization: Frame-sampling every 2–3 seconds rather than processing 30 FPS continuously.
+3. Posture Logic & Calibration: Uses a "Baseline Calibration" approach (capturing upright posture angles at start) + Exponential Moving Average (EMA) smoothing to eliminate keypoint jitter.
+4. Pre-trained Model Choice: Leveraging pre-trained yolov8n-pose.pt due to the 2-day timeline (custom dataset/annotation via CVAT was explicitly ruled out).
+5. Data Pipeline: Python computes posture state (HAPPY, NEUTRAL, SAD) and transmits state string to the Cube via Serial (pySerial).
+### Target Deliverables & Next Steps Needed
+Please provide the complete, production-ready Python script for the host machine. The code must include:
+1. Webcam capture via OpenCV with frame sampling rate limiting (every 2–3 seconds).
+2. Keypoint extraction (Right/Left Ear, Shoulder, Hip) using yolov8n-pose.
+3. Vector angle math calculation relative to vertical.
+4. Exponential Moving Average (EMA) smoothing filter to stop keypoint jitter.
+5. A simple calibration trigger (press 'c' to set baseline upright posture).
+6. State classification (HAPPY = good posture, NEUTRAL = mild tilt, SAD = slouch) with a simple pySerial output placeholder to send data to the microcontroller.
+Keep explanation concise and focus on modular, well-commented Python code.
+"""
+"""
 posture_monitor.py
 -------------------
 Host-side posture monitoring backend for the "Stats & Emotion Cube" project.
