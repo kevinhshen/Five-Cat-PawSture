@@ -6,13 +6,14 @@ Host-side posture monitoring backend for the "Stats & Emotion Cube" project.
 Pipeline:
     Webcam -> YOLOv8-Pose keypoints -> persistent object tracking -> target student filtering
     -> automatic front/side view selection -> calibrated view-specific posture metrics
-    -> EMA smoothing -> state classification -> Serial to microcontroller
+    -> EMA smoothing -> state classification -> Serial to microcontroller -> Audio Alert
 
 Dependencies:
-    pip install ultralytics opencv-python pyserial numpy
+    pip install ultralytics opencv-python pyserial numpy playsound==1.2.2
 """
 import argparse
 import time
+import threading
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
@@ -27,6 +28,11 @@ try:
 except ImportError:
     serial = None  # allow running without hardware connected
     list_ports = None
+
+try:
+    from playsound import playsound
+except ImportError:
+    playsound = None
 
 
 # --------------------------------------------------------------------------- #
@@ -46,10 +52,9 @@ class Config:
     ema_alpha: float = 0.3
 
     # -- Front-view geometry checks --
-    # In side/angled views, shoulder width collapses relative to the eyes or vice-versa.
     front_min_eye_shoulder_ratio: float = 0.16
-    front_max_eye_tilt_ratio: float = 0.8
-    front_min_shoulder_head_ratio: float = 2.2  # Shoulders must be at least 2.2x eye width for a valid front view
+    front_max_eye_tilt_ratio: float = 0.8  # Increased to allow head tilting
+    front_min_shoulder_head_ratio: float = 2.2 
 
     # -- Classification thresholds for front-view posture score (0-100) --
     neutral_score: float = 28.0
@@ -60,9 +65,16 @@ class Config:
     side_sad_deviation_deg: float = 20.0
 
     # -- Automatic view selection & hysteresis --
-    switch_confirm_samples: int = 5      # Consecutive samples required before changing views
-    switch_margin: float = 0.15          # Lead confidence needed to flip views
-    side_mode_bias: float = 0.15         # Extra confidence bias given to keep SIDE mode active
+    switch_confirm_samples: int = 5      
+    switch_margin: float = 0.15          
+    side_mode_bias: float = 0.15         
+
+    # -- Audio Alerts --
+    alert_sound_path: str = "alert.wav"  
+    audio_enabled_default: bool = True
+    bad_posture_trigger_s: float = 3.0   
+    mode_switch_grace_s: float = 4.0     
+    alert_cooldown_s: float = 5.0        
 
     # -- Serial --
     serial_port: Optional[str] = None
@@ -199,28 +211,19 @@ def extract_front_posture_metrics(
         return None
 
     # Geometry check 1.5: Profile Face Check
-    # If the face turns sideways, the 2D distance between the eyes collapses,
-    # but the nose sticks out. We reject the front view if the eyes are squished.
     if point_visible(confs, cfg.KP_NOSE, cfg):
         nose = keypoints[cfg.KP_NOSE]
         nose_to_eye_dist = float(np.linalg.norm(nose - eye_center))
-        
-        # If the gap between eyes is smaller than the distance to the nose, 
-        # it is physically impossible for the user to be facing forward.
         if eye_width_px < (nose_to_eye_dist * 0.9):
             return None
 
-    # Geometry check 1: Ratio of eye span to shoulder span
     if (eye_width_px / shoulder_width_px) < cfg.front_min_eye_shoulder_ratio:
         return None
 
-    # Geometry check 2: Eye vertical mismatch (tilt check)
     eye_tilt = normalized_y_gap(left_eye, right_eye, eye_width_px)
     if eye_tilt > cfg.front_max_eye_tilt_ratio:
         return None
 
-    # Geometry check 3: Unusual shoulder length check relative to eye width
-    # When turning sideways, shoulder width compresses faster than head width in 2D perspective.
     shoulder_head_ratio = shoulder_width_px / eye_width_px
     if shoulder_head_ratio < cfg.front_min_shoulder_head_ratio:
         return None
@@ -454,6 +457,11 @@ class PostureMonitor:
         self._last_reading = PostureReading(metrics=None)
         self._last_side_angles: Tuple[Optional[float], Optional[float]] = (None, None)
         self.target_track_id: Optional[int] = None
+        
+        self.audio_on = self.cfg.audio_enabled_default
+        self._bad_state_start_t = None
+        self._last_alert_t = 0.0
+        self._last_switch_t = 0.0
 
     def _extract_candidates(self, frame):
         results = self.model.track(
@@ -552,6 +560,7 @@ class PostureMonitor:
             self._active_mode = best_mode
             self._candidate_mode = None
             self._candidate_count = 0
+            self._last_switch_t = time.time()
             print(f"[view] Confirmed view switch to {self._active_mode} tracking.")
 
         return self._active_mode
@@ -671,7 +680,7 @@ class PostureMonitor:
 
     def run(self):
         print("Automatic front/side posture mode with student targeting.")
-        print("Press 'c' to calibrate & lock active target, 'q' to quit.")
+        print("Press 'c' to calibrate & lock active target, 'm' to mute, 'q' to quit.")
         try:
             while True:
                 ok, frame = self.cap.read()
@@ -693,8 +702,38 @@ class PostureMonitor:
                         else:
                             self._update_side(extracted)
 
+                if self._last_state == "SAD":
+                    if self._bad_state_start_t is None:
+                        self._bad_state_start_t = now 
+
+                    time_in_bad = now - self._bad_state_start_t
+                    time_since_switch = now - self._last_switch_t
+                    time_since_alert = now - self._last_alert_t
+
+                    if (self.audio_on and 
+                        time_in_bad >= self.cfg.bad_posture_trigger_s and
+                        time_since_switch >= self.cfg.mode_switch_grace_s and
+                        time_since_alert >= self.cfg.alert_cooldown_s):
+                        
+                        if playsound is not None:
+                            threading.Thread(
+                                target=playsound, 
+                                args=(self.cfg.alert_sound_path,), 
+                                daemon=True
+                            ).start()
+                            print("[audio] Alert played!")
+                        
+                        self._last_alert_t = now
+                else:
+                    self._bad_state_start_t = None
+
                 frame = self._draw_overlay(frame, self._last_reading, self._last_state)
-                cv2.imshow("Posture Monitor - Auto Front/Side (c=calibrate, q=quit)", frame)
+                
+                audio_status = "ON" if self.audio_on else "MUTED"
+                cv2.putText(frame, f"Audio: {audio_status} (press 'm')", (10, frame.shape[0] - 40), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+
+                cv2.imshow("Posture Monitor - Auto Front/Side", frame)
 
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
@@ -716,6 +755,9 @@ class PostureMonitor:
                         print(f"[tracking] Locked onto target student #{self.target_track_id}")
                     else:
                         print("[calibration] Wait for FRONT or SIDE mode before calibrating.")
+                if key == ord("m"):
+                    self.audio_on = not self.audio_on
+                    print(f"[audio] Alerts {'enabled' if self.audio_on else 'muted'}")
 
         finally:
             self.cap.release()
