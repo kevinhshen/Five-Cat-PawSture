@@ -83,14 +83,16 @@ class Config:
 @dataclass
 class FrontPostureMetrics:
     """
-    All values are normalized by shoulder width, so they are less sensitive to
-    camera resolution and distance than raw pixel measurements.
+    Most values are normalized by calibrated eye width or shoulder width, so
+    they are less sensitive to camera resolution and distance than raw pixels.
     """
 
+    eye_width_px: float         # distance between eyes; useful as a depth proxy
+    eye_drop: float             # eye center y relative to shoulder center
+    eye_tilt: float             # left/right eye height mismatch
+    eye_shift: float            # eye center x offset from shoulder center
     neck_height: float          # head center to shoulder center vertical gap
-    shoulder_slope: float       # left/right shoulder height mismatch
-    head_tilt: float            # left/right eye or ear height mismatch
-    center_shift: float         # head center x offset from shoulder center
+    shoulder_slope: float       # low-weight signal; pose shoulders can be noisy
     hip_shift: float            # shoulder center x offset from hip center
     shoulder_width_px: float
 
@@ -132,17 +134,24 @@ def normalized_y_gap(a: np.ndarray, b: np.ndarray, scale: float) -> float:
     return abs(float(a[1] - b[1])) / scale
 
 
+def choose_eye_pair(keypoints: np.ndarray, confs: np.ndarray, cfg: Config) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    if point_visible(confs, cfg.KP_L_EYE, cfg) and point_visible(confs, cfg.KP_R_EYE, cfg):
+        return keypoints[cfg.KP_L_EYE], keypoints[cfg.KP_R_EYE]
+
+    return None
+
+
 def choose_head_center(keypoints: np.ndarray, confs: np.ndarray, cfg: Config) -> Optional[Tuple[np.ndarray, str]]:
     """
-    Prefer ears because they line up naturally with shoulder height. Fall back to
-    eyes, then nose, because front-facing webcams often lose ears under hair or
-    headphones.
+    Ears line up naturally with shoulder height, but eyes are usually more stable
+    in a front-facing webcam. Nose is only a fallback for drawing/tracking.
     """
+    eye_pair = choose_eye_pair(keypoints, confs, cfg)
+    if eye_pair is not None:
+        return midpoint(*eye_pair), "eyes"
+
     if point_visible(confs, cfg.KP_L_EAR, cfg) and point_visible(confs, cfg.KP_R_EAR, cfg):
         return midpoint(keypoints[cfg.KP_L_EAR], keypoints[cfg.KP_R_EAR]), "ears"
-
-    if point_visible(confs, cfg.KP_L_EYE, cfg) and point_visible(confs, cfg.KP_R_EYE, cfg):
-        return midpoint(keypoints[cfg.KP_L_EYE], keypoints[cfg.KP_R_EYE]), "eyes"
 
     if point_visible(confs, cfg.KP_NOSE, cfg):
         return keypoints[cfg.KP_NOSE], "nose"
@@ -172,11 +181,15 @@ def extract_front_posture_metrics(
     if shoulder_width_px < 20:
         return None
 
-    head_tilt = 0.0
-    if point_visible(confs, cfg.KP_L_EAR, cfg) and point_visible(confs, cfg.KP_R_EAR, cfg):
-        head_tilt = normalized_y_gap(keypoints[cfg.KP_L_EAR], keypoints[cfg.KP_R_EAR], shoulder_width_px)
-    elif point_visible(confs, cfg.KP_L_EYE, cfg) and point_visible(confs, cfg.KP_R_EYE, cfg):
-        head_tilt = normalized_y_gap(keypoints[cfg.KP_L_EYE], keypoints[cfg.KP_R_EYE], shoulder_width_px)
+    eye_pair = choose_eye_pair(keypoints, confs, cfg)
+    if eye_pair is None:
+        return None
+
+    left_eye, right_eye = eye_pair
+    eye_center = midpoint(left_eye, right_eye)
+    eye_width_px = float(np.linalg.norm(left_eye - right_eye))
+    if eye_width_px < 8:
+        return None
 
     hip_center = None
     hip_shift = 0.0
@@ -185,10 +198,12 @@ def extract_front_posture_metrics(
         hip_shift = normalized_x_gap(shoulder_center, hip_center, shoulder_width_px)
 
     metrics = FrontPostureMetrics(
+        eye_width_px=eye_width_px,
+        eye_drop=float(eye_center[1] - shoulder_center[1]) / shoulder_width_px,
+        eye_tilt=normalized_y_gap(left_eye, right_eye, eye_width_px),
+        eye_shift=normalized_x_gap(eye_center, shoulder_center, shoulder_width_px),
         neck_height=normalized_vertical_gap(head_center, shoulder_center, shoulder_width_px),
         shoulder_slope=normalized_y_gap(left_shoulder, right_shoulder, shoulder_width_px),
-        head_tilt=head_tilt,
-        center_shift=normalized_x_gap(head_center, shoulder_center, shoulder_width_px),
         hip_shift=hip_shift,
         shoulder_width_px=shoulder_width_px,
     )
@@ -199,6 +214,9 @@ def extract_front_posture_metrics(
         "right_shoulder": right_shoulder,
         "shoulder_center": shoulder_center,
         "head_source": head_source,
+        "left_eye": left_eye,
+        "right_eye": right_eye,
+        "eye_center": eye_center,
     }
     if hip_center is not None:
         tracking_points["hip_center"] = hip_center
@@ -210,25 +228,29 @@ def extract_front_posture_metrics(
 
 def score_front_posture(metrics: FrontPostureMetrics, baseline: FrontPostureMetrics) -> Tuple[float, float]:
     """
-    Build a practical front-facing posture score.
+    Build a practical front-facing posture score with eye/head tracking as the
+    primary signal. This is not true 3D triangulation, but eye width gives a
+    useful calibrated proxy for moving closer to the camera.
 
-    The strongest signal is neck compression: if head-to-shoulder height gets
-    shorter than the calibrated upright baseline, the student is probably
-    dropping the head, hunching, or collapsing the shoulders. Side-to-side tilt
-    and center shifts catch leaning and asymmetry.
+    Shoulder slope is intentionally low-weight because the pose model may move
+    shoulder keypoints slightly when the head tilts.
     """
     compression = max(0.0, (baseline.neck_height - metrics.neck_height) / max(baseline.neck_height, 1e-6))
-    shoulder_slope_extra = max(0.0, metrics.shoulder_slope - baseline.shoulder_slope)
-    head_tilt_extra = max(0.0, metrics.head_tilt - baseline.head_tilt)
-    center_shift_extra = max(0.0, metrics.center_shift - baseline.center_shift)
+    eye_drop_extra = max(0.0, metrics.eye_drop - baseline.eye_drop)
+    eye_tilt_extra = max(0.0, metrics.eye_tilt - baseline.eye_tilt)
+    eye_shift_extra = max(0.0, metrics.eye_shift - baseline.eye_shift)
+    face_close_extra = max(0.0, (metrics.eye_width_px / max(baseline.eye_width_px, 1e-6)) - 1.0)
     hip_shift_extra = max(0.0, metrics.hip_shift - baseline.hip_shift)
+    shoulder_slope_extra = max(0.0, metrics.shoulder_slope - baseline.shoulder_slope)
 
     score = (
-        compression * 95.0
-        + shoulder_slope_extra * 95.0
-        + head_tilt_extra * 85.0
-        + center_shift_extra * 70.0
-        + hip_shift_extra * 45.0
+        eye_drop_extra * 115.0
+        + eye_tilt_extra * 85.0
+        + eye_shift_extra * 70.0
+        + face_close_extra * 65.0
+        + compression * 45.0
+        + hip_shift_extra * 30.0
+        + shoulder_slope_extra * 12.0
     )
     return min(score, 100.0), compression * 100.0
 
@@ -268,10 +290,12 @@ class MetricSmoother:
 
     def __init__(self, alpha: float):
         self.smoothers = {
+            "eye_width_px": EMASmoother(alpha),
+            "eye_drop": EMASmoother(alpha),
+            "eye_tilt": EMASmoother(alpha),
+            "eye_shift": EMASmoother(alpha),
             "neck_height": EMASmoother(alpha),
             "shoulder_slope": EMASmoother(alpha),
-            "head_tilt": EMASmoother(alpha),
-            "center_shift": EMASmoother(alpha),
             "hip_shift": EMASmoother(alpha),
             "shoulder_width_px": EMASmoother(alpha),
         }
@@ -292,10 +316,12 @@ class MetricSmoother:
         if self.smoothers["neck_height"].value is None:
             return None
         return FrontPostureMetrics(
+            eye_width_px=self.smoothers["eye_width_px"].value,
+            eye_drop=self.smoothers["eye_drop"].value,
+            eye_tilt=self.smoothers["eye_tilt"].value,
+            eye_shift=self.smoothers["eye_shift"].value,
             neck_height=self.smoothers["neck_height"].value,
             shoulder_slope=self.smoothers["shoulder_slope"].value,
-            head_tilt=self.smoothers["head_tilt"].value,
-            center_shift=self.smoothers["center_shift"].value,
             hip_shift=self.smoothers["hip_shift"].value,
             shoulder_width_px=self.smoothers["shoulder_width_px"].value,
         )
@@ -397,10 +423,11 @@ class PostureMonitor:
         self.score_smoother.reset()
         print(
             "[calibration] Baseline set -> "
-            f"neck height: {metrics.neck_height:.2f}, "
-            f"shoulder slope: {metrics.shoulder_slope:.2f}, "
-            f"head tilt: {metrics.head_tilt:.2f}, "
-            f"center shift: {metrics.center_shift:.2f}"
+            f"eye width: {metrics.eye_width_px:.1f}px, "
+            f"eye drop: {metrics.eye_drop:.2f}, "
+            f"eye tilt: {metrics.eye_tilt:.2f}, "
+            f"eye shift: {metrics.eye_shift:.2f}, "
+            f"shoulder slope: {metrics.shoulder_slope:.2f}"
         )
 
     # ---------------------------------------------------------------- #
@@ -415,9 +442,12 @@ class PostureMonitor:
         lines = [
             f"State: {state}",
             f"Posture score: {score:.0f}/100" if score is not None else "Posture score: --",
-            f"Neck compression: {compression:.0f}%" if compression is not None else "Neck compression: --",
+            f"Eye drop: {metrics.eye_drop:.2f}" if metrics is not None else "Eye drop: --",
+            f"Eye tilt: {metrics.eye_tilt:.2f}" if metrics is not None else "Eye tilt: --",
+            f"Eye shift: {metrics.eye_shift:.2f}" if metrics is not None else "Eye shift: --",
+            f"Face distance: {metrics.eye_width_px:.0f}px" if metrics is not None else "Face distance: --",
             f"Shoulder slope: {metrics.shoulder_slope:.2f}" if metrics is not None else "Shoulder slope: --",
-            f"Head/torso shift: {metrics.center_shift:.2f}" if metrics is not None else "Head/torso shift: --",
+            f"Neck compression: {compression:.0f}%" if compression is not None else "Neck compression: --",
             "Baseline: SET" if self.baseline.calibrated else "Baseline: NOT SET (press 'c')",
         ]
         color = {"HAPPY": (0, 200, 0), "NEUTRAL": (0, 200, 200), "SAD": (0, 0, 220)}.get(state, (255, 255, 255))
@@ -434,13 +464,17 @@ class PostureMonitor:
             return frame
 
         head = tuple(points["head"].astype(int))
+        left_eye = tuple(points["left_eye"].astype(int))
+        right_eye = tuple(points["right_eye"].astype(int))
+        eye_center = tuple(points["eye_center"].astype(int))
         left_shoulder = tuple(points["left_shoulder"].astype(int))
         right_shoulder = tuple(points["right_shoulder"].astype(int))
         shoulder_center = tuple(points["shoulder_center"].astype(int))
 
+        cv2.line(frame, left_eye, right_eye, (0, 255, 255), 3)
         cv2.line(frame, left_shoulder, right_shoulder, (255, 180, 0), 3)
-        cv2.line(frame, shoulder_center, head, (255, 180, 0), 3)
-        cv2.line(frame, (head[0], shoulder_center[1]), shoulder_center, (180, 180, 180), 2)
+        cv2.line(frame, shoulder_center, eye_center, (255, 180, 0), 3)
+        cv2.line(frame, (eye_center[0], shoulder_center[1]), shoulder_center, (180, 180, 180), 2)
 
         if "left_hip" in points and "right_hip" in points:
             left_hip = tuple(points["left_hip"].astype(int))
@@ -451,7 +485,10 @@ class PostureMonitor:
             cv2.circle(frame, hip_center, 6, (0, 180, 255), -1)
 
         draw_points = [
-            ("Head", head, (0, 255, 255)),
+            ("L Eye", left_eye, (0, 255, 255)),
+            ("R Eye", right_eye, (0, 255, 255)),
+            ("Eye Center", eye_center, (0, 220, 220)),
+            ("Head", head, (0, 180, 255)),
             ("L Shoulder", left_shoulder, (255, 0, 255)),
             ("R Shoulder", right_shoulder, (255, 0, 255)),
             ("Shoulders", shoulder_center, (255, 180, 0)),
