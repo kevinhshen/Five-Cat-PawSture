@@ -506,22 +506,74 @@ class PostureMonitor:
         self._last_reading = PostureReading(metrics=None)
         self._last_side_angles: Tuple[Optional[float], Optional[float]] = (None, None)
         self._history = deque(maxlen=100)
+        self.target_track_id: Optional[int] = None  # Track ID locked to the student user
 
     # ---------------------------------------------------------------- #
     def _extract_candidates(self, frame):
-        """Run YOLO once and prepare independent front and side candidates."""
-        results = self.model(frame, verbose=False, imgsz=self.cfg.model_imgsz)[0]
+        """Run YOLO tracking and extract candidates strictly for the locked target student."""
+        # Run YOLO with persistent multi-object tracking enabled
+        results = self.model.track(
+            frame,
+            persist=True,
+            verbose=False,
+            imgsz=self.cfg.model_imgsz
+        )[0]
 
         if results.keypoints is None or len(results.keypoints.xy) == 0:
             return {}
 
-        keypoints = results.keypoints.xy[0].cpu().numpy()
-        confs = results.keypoints.conf[0].cpu().numpy()
+        # 1. Retrieve persistent tracking IDs from detection boxes (if present)
+        track_ids = None
+        if results.boxes is not None and results.boxes.id is not None:
+            track_ids = results.boxes.id.int().cpu().numpy()
+
+        target_idx = None
+
+        # 2. Match active target ID if already locked
+        if self.target_track_id is not None and track_ids is not None:
+            matches = np.where(track_ids == self.target_track_id)[0]
+            if len(matches) > 0:
+                target_idx = matches[0]
+
+        # 3. Fallback: Find the person closest to the image center if no locked target matches
+        if target_idx is None:
+            frame_h, frame_w = frame.shape[:2]
+            frame_center = np.array([frame_w / 2.0, frame_h / 2.0])
+            min_dist = float("inf")
+
+            for i, kpts in enumerate(results.keypoints.xy):
+                kpts_np = kpts.cpu().numpy()
+                visible = kpts_np[kpts_np.any(axis=1)]
+                if len(visible) == 0:
+                    continue
+
+                # Center point calculated from visible keypoints
+                center = visible.mean(axis=0)
+                dist = np.linalg.norm(center - frame_center)
+                if dist < min_dist:
+                    min_dist = dist
+                    target_idx = i
+
+            # Auto-assign target track ID from nearest person
+            if target_idx is not None and track_ids is not None:
+                self.target_track_id = int(track_ids[target_idx])
+
+        if target_idx is None:
+            return {}
+
+        # 4. Extract keypoints exclusively for the target student
+        keypoints = results.keypoints.xy[target_idx].cpu().numpy()
+        confs = results.keypoints.conf[target_idx].cpu().numpy()
         candidates = {}
 
         front = extract_front_posture_metrics(keypoints, confs, self.cfg)
         if front is not None:
-            required = (self.cfg.KP_L_EYE, self.cfg.KP_R_EYE, self.cfg.KP_L_SHOULDER, self.cfg.KP_R_SHOULDER)
+            required = (
+                self.cfg.KP_L_EYE,
+                self.cfg.KP_R_EYE,
+                self.cfg.KP_L_SHOULDER,
+                self.cfg.KP_R_SHOULDER,
+            )
             quality = float(np.mean(confs[list(required)]))
             candidates["FRONT"] = (quality, front)
 
@@ -529,6 +581,7 @@ class PostureMonitor:
         if side is not None:
             ear, shoulder, hip, quality, side_name = side
             candidates["SIDE"] = (quality, (ear, shoulder, hip, side_name))
+
         return candidates
 
     # ---------------------------------------------------------------- #
@@ -729,16 +782,21 @@ class PostureMonitor:
                 if key == ord("q"):
                     break
                 if key == ord("c"):
+                    # Clear current lock so it selects the person closest to frame center
+                    self.target_track_id = None
                     candidates = self._extract_candidates(frame)
                     active_mode = self._select_mode(candidates)
+
                     if active_mode == "FRONT" and active_mode in candidates:
                         _, extracted = candidates[active_mode]
                         metrics, _ = extracted
                         self._calibrate_front(metrics)
+                        print(f"[tracking] Locked to student target ID #{self.target_track_id}")
                     elif active_mode == "SIDE" and active_mode in candidates:
                         _, extracted = candidates[active_mode]
                         ear, shoulder, hip, _ = extracted
                         self._calibrate_side(angle_from_vertical(ear, shoulder), angle_from_vertical(shoulder, hip))
+                        print(f"[tracking] Locked to student target ID #{self.target_track_id}")
                     else:
                         print("[calibration] Wait for FRONT or SIDE mode before calibrating.")
 
