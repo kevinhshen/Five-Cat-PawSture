@@ -1,5 +1,5 @@
 """
-PawSture
+posture_monitor.py
 -------------------
 Host-side posture monitoring backend for the "Stats & Emotion Cube" project.
 
@@ -10,7 +10,7 @@ Pipeline:
 
 Hardware assumptions:
     - Side-view webcam, 3-5 ft away, shoulder height, subject facing left or right.
-    - Arduino listening on a serial port for single-word state strings.
+    - ESP32/Arduino listening on a serial port for single-word state strings.
 
 Controls:
     'c' -> calibrate baseline (hold upright posture, then press)
@@ -33,8 +33,10 @@ from ultralytics import YOLO
 
 try:
     import serial  # pyserial
+    from serial.tools import list_ports
 except ImportError:
     serial = None  # allow running without hardware connected
+    list_ports = None
 
 
 # --------------------------------------------------------------------------- #
@@ -46,16 +48,21 @@ class Config:
     # -- Model / capture --
     model_path: str = "yolo26n-pose.pt"
     camera_index: int = 0
-    sample_interval_s: float = 1.0          # seconds between side profile snapshots
-    model_imgsz: int = 320                  # smaller inference image = faster checks/display
+    sample_interval_s: float = 2.5          # process ~1 frame every 2-3s (load optimization)
     conf_threshold: float = 0.5             # min keypoint confidence to trust a point
 
     # -- Smoothing --
     ema_alpha: float = 0.3                  # 0 = no update, 1 = no smoothing at all
 
     # -- Classification thresholds (degrees of DEVIATION from calibrated baseline) --
-    neutral_deviation_deg: float = 8.0      # up to this = still HAPPY
-    sad_deviation_deg: float = 16.0         # beyond this = SAD, between = NEUTRAL
+    # If you're getting false SAD readings with good posture, raise these first.
+    neutral_deviation_deg: float = 10.0     # up to this = still HAPPY
+    sad_deviation_deg: float = 20.0         # beyond this = SAD, between = NEUTRAL
+
+    # -- Noise reduction --
+    burst_frames: int = 3                   # frames grabbed & averaged per sample (reduces 1-frame jitter)
+    burst_delay_s: float = 0.05             # gap between burst frames
+    confirm_count: int = 2                  # consecutive matching samples required before state actually changes
 
     # -- Serial --
     serial_port: Optional[str] = None       # e.g. "COM5" or "/dev/ttyUSB0"; None = disabled
@@ -125,6 +132,34 @@ def pick_side(keypoints: np.ndarray, confs: np.ndarray, cfg: Config
     return ear, shoulder, hip
 
 
+def draw_keypoints(frame, ear: np.ndarray, shoulder: np.ndarray, hip: np.ndarray):
+    """
+    Draw the three tracked keypoints and the two vectors used for angle math
+    directly onto the frame. This is the main debugging tool: if the dots
+    land on the wrong body part (or drift), that's your false-reading cause,
+    not the thresholds.
+    """
+    ear_pt = tuple(ear.astype(int))
+    shoulder_pt = tuple(shoulder.astype(int))
+    hip_pt = tuple(hip.astype(int))
+
+    # Vectors used for angle calculation
+    cv2.line(frame, shoulder_pt, ear_pt, (255, 200, 0), 2)    # neck vector
+    cv2.line(frame, hip_pt, shoulder_pt, (0, 165, 255), 2)    # trunk vector
+
+    # Keypoint dots
+    for pt, color, label in (
+        (ear_pt, (255, 0, 0), "Ear"),
+        (shoulder_pt, (0, 255, 0), "Shoulder"),
+        (hip_pt, (0, 0, 255), "Hip"),
+    ):
+        cv2.circle(frame, pt, 6, color, -1)
+        cv2.putText(frame, label, (pt[0] + 8, pt[1] - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+
+    return frame
+
+
 # --------------------------------------------------------------------------- #
 # EMA smoothing
 # --------------------------------------------------------------------------- #
@@ -167,10 +202,52 @@ class Baseline:
 # Serial link
 # --------------------------------------------------------------------------- #
 
+def auto_detect_port() -> Optional[str]:
+    """
+    Scan available serial ports and return the first one that looks like an
+    Arduino/USB-serial device. Handles the fact that macOS reassigns
+    /dev/cu.usbmodemXXXX numbers between sessions, so you don't have to
+    manually check Tools -> Port every time.
+
+    Returns None if pyserial isn't installed or no matching port is found.
+    """
+    if list_ports is None:
+        return None
+
+    ports = list(list_ports.comports())
+    if not ports:
+        return None
+
+    # Common substrings seen in Arduino/USB-serial device names/descriptions
+    # across macOS, Windows, and Linux.
+    candidates_keywords = ("usbmodem", "usbserial", "arduino", "ch340", "wchusbserial", "ttyusb", "ttyacm")
+
+    for p in ports:
+        device_lower = p.device.lower()
+        desc_lower = (p.description or "").lower()
+        if any(kw in device_lower or kw in desc_lower for kw in candidates_keywords):
+            print(f"[serial] Auto-detected port: {p.device} ({p.description})")
+            return p.device
+
+    # Fallback: if exactly one port exists at all, just use it
+    if len(ports) == 1:
+        print(f"[serial] Only one port available, using it: {ports[0].device}")
+        return ports[0].device
+
+    print("[serial] Could not confidently auto-detect a port. Available ports:")
+    for p in ports:
+        print(f"    {p.device} ({p.description})")
+    return None
+
+
 class SerialLink:
     """Thin wrapper around pyserial with graceful no-op fallback."""
 
     def __init__(self, port: Optional[str], baud: int, min_interval_s: float):
+        # If no port was explicitly given, try to auto-detect one before giving up.
+        if port is None:
+            port = auto_detect_port()
+
         self.enabled = port is not None and serial is not None
         self.min_interval_s = min_interval_s
         self._last_sent = 0.0
@@ -249,17 +326,23 @@ class PostureMonitor:
 
         self._last_sample_t = 0.0
         self._last_state = "NEUTRAL"
-        self._last_tracking_points = None
+        self._last_points = None  # (ear, shoulder, hip) from most recent detection, for drawing
+        # Debounce: only commit a state change after it repeats confirm_count times in a row
+        self._pending_state = "NEUTRAL"
+        self._pending_count = 0
         # small rolling history purely for on-screen debug/plotting if desired
         self._history = deque(maxlen=100)
 
     # ---------------------------------------------------------------- #
-    def _extract_angles(self, frame) -> Optional[Tuple[float, float]]:
-        """Run pose model on one frame, return (neck_angle, trunk_angle) or None."""
-        results = self.model(frame, verbose=False, imgsz=self.cfg.model_imgsz)[0]
+    def _extract_angles(self, frame):
+        """
+        Run pose model on one frame.
+        Returns (neck_angle, trunk_angle, (ear, shoulder, hip)) or None.
+        The points are returned so the caller can draw them for debugging.
+        """
+        results = self.model(frame, verbose=False)[0]
 
         if results.keypoints is None or len(results.keypoints.xy) == 0:
-            self._last_tracking_points = None
             return None
 
         # Use the first detected person (assume single-student desk setup)
@@ -268,20 +351,41 @@ class PostureMonitor:
 
         picked = pick_side(keypoints, confs, self.cfg)
         if picked is None:
-            self._last_tracking_points = None
             return None
 
         ear, shoulder, hip = picked
-        self._last_tracking_points = {
-            "ear": ear,
-            "shoulder": shoulder,
-            "hip": hip,
-        }
 
         neck_angle = angle_from_vertical(ear, shoulder)     # forward head posture
         trunk_angle = angle_from_vertical(shoulder, hip)    # slouch
 
-        return neck_angle, trunk_angle
+        return neck_angle, trunk_angle, (ear, shoulder, hip)
+
+    # ---------------------------------------------------------------- #
+    def _sample_burst(self):
+        """
+        Grab several frames in quick succession and average their angles.
+        This smooths out a single bad-detection frame, which is the most
+        common cause of a one-off false SAD/HAPPY reading.
+        Returns (neck_angle, trunk_angle, last_points) or None if nothing usable.
+        """
+        neck_vals, trunk_vals, last_points = [], [], None
+
+        for _ in range(self.cfg.burst_frames):
+            ok, frame = self.cap.read()
+            if not ok:
+                continue
+            result = self._extract_angles(frame)
+            if result is not None:
+                neck_angle, trunk_angle, points = result
+                neck_vals.append(neck_angle)
+                trunk_vals.append(trunk_angle)
+                last_points = points
+            time.sleep(self.cfg.burst_delay_s)
+
+        if not neck_vals:
+            return None
+
+        return float(np.mean(neck_vals)), float(np.mean(trunk_vals)), last_points
 
     # ---------------------------------------------------------------- #
     def _handle_calibration(self, neck_angle: float, trunk_angle: float):
@@ -293,8 +397,6 @@ class PostureMonitor:
 
     # ---------------------------------------------------------------- #
     def _draw_overlay(self, frame, neck_angle, trunk_angle, state):
-        frame = self._draw_tracking_overlay(frame)
-
         y = 30
         lines = [
             f"State: {state}",
@@ -306,42 +408,6 @@ class PostureMonitor:
         for line in lines:
             cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             y += 25
-        return frame
-
-    # ---------------------------------------------------------------- #
-    def _draw_tracking_overlay(self, frame):
-        """Draw the keypoints and posture vectors used for angle calculation."""
-        if self._last_tracking_points is None:
-            return frame
-
-        ear = tuple(self._last_tracking_points["ear"].astype(int))
-        shoulder = tuple(self._last_tracking_points["shoulder"].astype(int))
-        hip = tuple(self._last_tracking_points["hip"].astype(int))
-
-        cv2.line(frame, shoulder, ear, (255, 180, 0), 3)
-        cv2.line(frame, hip, shoulder, (255, 180, 0), 3)
-
-        vertical_top = (shoulder[0], max(0, shoulder[1] - 90))
-        cv2.line(frame, shoulder, vertical_top, (180, 180, 180), 2)
-
-        points = [
-            ("Ear", ear, (0, 255, 255)),
-            ("Shoulder", shoulder, (255, 0, 255)),
-            ("Hip", hip, (0, 180, 255)),
-        ]
-        for label, point, color in points:
-            cv2.circle(frame, point, 7, color, -1)
-            cv2.circle(frame, point, 10, (0, 0, 0), 2)
-            cv2.putText(
-                frame,
-                label,
-                (point[0] + 10, point[1] - 10),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                color,
-                2,
-            )
-
         return frame
 
     # ---------------------------------------------------------------- #
@@ -358,30 +424,47 @@ class PostureMonitor:
                 now = time.time()
                 do_inference = (now - self._last_sample_t) >= self.cfg.sample_interval_s
 
-                neck_angle_raw = trunk_angle_raw = None
                 neck_smoothed = self.neck_smoother.value
                 trunk_smoothed = self.trunk_smoother.value
 
                 if do_inference:
                     self._last_sample_t = now
-                    angles = self._extract_angles(frame)
-                    if angles is not None:
-                        neck_angle_raw, trunk_angle_raw = angles
+                    result = self._sample_burst()  # averages a few frames, reduces single-frame noise
+                    if result is not None:
+                        neck_angle_raw, trunk_angle_raw, points = result
+                        self._last_points = points
                         neck_smoothed = self.neck_smoother.update(neck_angle_raw)
                         trunk_smoothed = self.trunk_smoother.update(trunk_angle_raw)
 
                         if self.baseline.calibrated:
                             neck_dev = neck_smoothed - self.baseline.neck_angle
                             trunk_dev = trunk_smoothed - self.baseline.trunk_angle
-                            state = classify_state(neck_dev, trunk_dev, self.cfg)
-                            self._last_state = state
-                            self._history.append((now, neck_dev, trunk_dev, state))
-                            self.serial_link.send_state(state)
+                            candidate = classify_state(neck_dev, trunk_dev, self.cfg)
+
+                            # Debounce: only commit the new state after it repeats
+                            # confirm_count times in a row, so one noisy sample
+                            # can't flip HAPPY -> SAD by itself.
+                            if candidate == self._pending_state:
+                                self._pending_count += 1
+                            else:
+                                self._pending_state = candidate
+                                self._pending_count = 1
+
+                            if self._pending_count >= self.cfg.confirm_count:
+                                self._last_state = candidate
+
+                            self._history.append((now, neck_dev, trunk_dev, self._last_state))
+                            self.serial_link.send_state(self._last_state)
                         else:
                             # No baseline yet: report NEUTRAL as a safe default
                             self._last_state = "NEUTRAL"
 
-                # Overlay + display every rendered frame (cheap), inference only every N seconds
+                # Draw keypoints every rendered frame using the most recent detection,
+                # even on frames where we didn't run inference (keeps overlay stable).
+                if self._last_points is not None:
+                    ear, shoulder, hip = self._last_points
+                    frame = draw_keypoints(frame, ear, shoulder, hip)
+
                 frame = self._draw_overlay(
                     frame,
                     neck_smoothed,
@@ -395,9 +478,11 @@ class PostureMonitor:
                     break
                 elif key == ord('c'):
                     # Force an immediate inference pass for calibration, don't wait for sample timer
-                    angles = self._extract_angles(frame)
-                    if angles is not None:
-                        self._handle_calibration(*angles)
+                    result = self._extract_angles(frame)
+                    if result is not None:
+                        neck_angle, trunk_angle, points = result
+                        self._last_points = points
+                        self._handle_calibration(neck_angle, trunk_angle)
                     else:
                         print("[calibration] No confident keypoints detected — adjust position and retry.")
 
@@ -415,17 +500,16 @@ def parse_args() -> Config:
     p = argparse.ArgumentParser(description="Posture monitor backend for Stats & Emotion Cube")
     p.add_argument("--model", default="yolo26n-pose.pt")
     p.add_argument("--camera", type=int, default=0)
-    p.add_argument("--interval", type=float, default=1.0, help="Seconds between inference samples")
-    p.add_argument("--imgsz", type=int, default=320, help="YOLO inference image size; lower is faster")
-    p.add_argument("--port", type=str, default=None, help="Serial port, e.g. COM5 or /dev/ttyUSB0")
-    p.add_argument("--baud", type=int, default=115200)
+    p.add_argument("--interval", type=float, default=2.5, help="Seconds between inference samples")
+    p.add_argument("--port", type=str, default=None,
+                    help="Serial port, e.g. COM5 or /dev/ttyUSB0. If omitted, auto-detects an Arduino/USB-serial port.")
+    p.add_argument("--baud", type=int, default=9600, help="Must match Serial.begin(...) in the .ino sketch")
     args = p.parse_args()
 
     return Config(
         model_path=args.model,
         camera_index=args.camera,
         sample_interval_s=args.interval,
-        model_imgsz=args.imgsz,
         serial_port=args.port,
         serial_baud=args.baud,
     )
