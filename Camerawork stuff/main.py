@@ -1,5 +1,5 @@
 """
-posture_monitor.py
+PawSture
 -------------------
 Host-side posture monitoring backend for the "Stats & Emotion Cube" project.
 
