@@ -9,11 +9,13 @@ Pipeline:
     -> EMA smoothing -> state classification -> Serial to microcontroller -> Audio Alert
 
 Dependencies:
-    pip install ultralytics opencv-python pyserial numpy playsound==1.2.2
+    pip install ultralytics opencv-python pyserial numpy
 """
 import argparse
 import time
 import threading
+import platform
+import subprocess
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
@@ -28,11 +30,6 @@ try:
 except ImportError:
     serial = None  # allow running without hardware connected
     list_ports = None
-
-try:
-    from playsound import playsound
-except ImportError:
-    playsound = None
 
 
 # --------------------------------------------------------------------------- #
@@ -73,7 +70,7 @@ class Config:
     alert_sound_path: str = "alert.wav"  
     audio_enabled_default: bool = True
     bad_posture_trigger_s: float = 3.0   
-    mode_switch_grace_s: float = 4.0     
+    mode_switch_grace_s: float = 10.0     
     alert_cooldown_s: float = 5.0        
 
     # -- Serial --
@@ -91,6 +88,31 @@ class Config:
     KP_R_SHOULDER: int = 6
     KP_L_HIP: int = 11
     KP_R_HIP: int = 12
+
+
+# --------------------------------------------------------------------------- #
+# Audio Helper (Cross-Platform)
+# --------------------------------------------------------------------------- #
+
+def play_alert_sound(sound_path: str):
+    """Plays an audio file using native OS tools (no external libraries required)."""
+    current_os = platform.system()
+    
+    try:
+        if current_os == "Darwin":
+            # macOS built-in audio player
+            subprocess.run(["afplay", sound_path], check=True)
+        elif current_os == "Windows":
+            # Windows built-in audio library
+            import winsound
+            winsound.PlaySound(sound_path, winsound.SND_FILENAME)
+        elif current_os == "Linux":
+            # standard Linux audio player
+            subprocess.run(["aplay", sound_path], check=True)
+        else:
+            print(f"[audio] Unsupported OS for audio playback: {current_os}")
+    except Exception as e:
+        print(f"[audio] Failed to play sound: {e}")
 
 
 # --------------------------------------------------------------------------- #
@@ -715,13 +737,13 @@ class PostureMonitor:
                         time_since_switch >= self.cfg.mode_switch_grace_s and
                         time_since_alert >= self.cfg.alert_cooldown_s):
                         
-                        if playsound is not None:
-                            threading.Thread(
-                                target=playsound, 
-                                args=(self.cfg.alert_sound_path,), 
-                                daemon=True
-                            ).start()
-                            print("[audio] Alert played!")
+                        # Trigger cross-platform sound in a background thread
+                        threading.Thread(
+                            target=play_alert_sound, 
+                            args=(self.cfg.alert_sound_path,), 
+                            daemon=True
+                        ).start()
+                        print("[audio] Alert played!")
                         
                         self._last_alert_t = now
                 else:
