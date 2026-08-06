@@ -10,7 +10,7 @@ Pipeline:
 
 Hardware assumptions:
     - Side-view webcam, 3-5 ft away, shoulder height, subject facing left or right.
-    - ESP32/Arduino listening on a serial port for single-word state strings.
+    - Arduino listening on a serial port for single-word state strings.
 
 Controls:
     'c' -> calibrate baseline (hold upright posture, then press)
@@ -46,7 +46,7 @@ class Config:
     # -- Model / capture --
     model_path: str = "yolo26n-pose.pt"
     camera_index: int = 0
-    sample_interval_s: float = 1.0          # seconds between AI posture checks
+    sample_interval_s: float = 1.0          # seconds between side profile snapshots
     model_imgsz: int = 320                  # smaller inference image = faster checks/display
     conf_threshold: float = 0.5             # min keypoint confidence to trust a point
 
