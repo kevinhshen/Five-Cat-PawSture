@@ -34,8 +34,10 @@ from ultralytics import YOLO
 
 try:
     import serial  # pyserial
+    from serial.tools import list_ports
 except ImportError:
     serial = None  # allow running without hardware connected
+    list_ports = None
 
 
 # --------------------------------------------------------------------------- #
@@ -393,10 +395,45 @@ class MetricSmoother:
 # Serial link
 # --------------------------------------------------------------------------- #
 
+def auto_detect_port() -> Optional[str]:
+    """Find a likely Arduino/USB serial port when --port is not supplied."""
+    if list_ports is None:
+        return None
+
+    ports = list(list_ports.comports())
+    if not ports:
+        return None
+
+    keywords = (
+        "usbmodem",
+        "usbserial",
+        "arduino",
+        "ch340",
+        "wchusbserial",
+        "ttyusb",
+        "ttyacm",
+    )
+    for port in ports:
+        device = port.device.lower()
+        description = (port.description or "").lower()
+        if any(keyword in device or keyword in description for keyword in keywords):
+            print(f"[serial] Auto-detected port: {port.device} ({port.description})")
+            return port.device
+
+    if len(ports) == 1:
+        print(f"[serial] Only one port available, using it: {ports[0].device}")
+        return ports[0].device
+
+    print("[serial] Could not confidently auto-detect an Arduino port. Use --port to choose one.")
+    return None
+
 class SerialLink:
     """Thin wrapper around pyserial with graceful no-op fallback."""
 
     def __init__(self, port: Optional[str], baud: int, min_interval_s: float):
+        if port is None:
+            port = auto_detect_port()
+
         self.enabled = port is not None and serial is not None
         self.min_interval_s = min_interval_s
         self._last_sent = 0.0
