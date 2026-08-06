@@ -4,28 +4,28 @@ PawSture
 Host-side posture monitoring backend for the "Stats & Emotion Cube" project.
 
 Pipeline:
-    Webcam (side view) -> YOLO26-Pose keypoints -> vector angle math
-    -> EMA smoothing -> baseline calibration comparison
-    -> state classification (HAPPY / NEUTRAL / SAD) -> Serial to microcontroller
+    Front-facing webcam -> YOLOv8-Pose keypoints -> calibrated front-view
+    posture metrics -> EMA smoothing -> state classification
+    -> Serial to microcontroller
 
 Hardware assumptions:
-    - Side-view webcam, 3-5 ft away, shoulder height, subject facing left or right.
+    - Front-facing webcam or laptop camera aimed at the student from the front.
+    - Camera should see the face, both shoulders, and ideally both hips.
     - Arduino listening on a serial port for single-word state strings.
 
 Controls:
-    'c' -> calibrate baseline (hold upright posture, then press)
+    'c' -> calibrate baseline (sit upright first, then press)
     'q' -> quit
 
 Dependencies:
     pip install ultralytics opencv-python pyserial numpy
 """
 
-import time
-import math
 import argparse
+import time
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -44,27 +44,30 @@ except ImportError:
 @dataclass
 class Config:
     # -- Model / capture --
-    model_path: str = "yolo26n-pose.pt"
+    model_path: str = "yolov8n-pose.pt"
     camera_index: int = 0
-    sample_interval_s: float = 1.0          # seconds between side profile snapshots
-    model_imgsz: int = 320                  # smaller inference image = faster checks/display
-    conf_threshold: float = 0.5             # min keypoint confidence to trust a point
+    sample_interval_s: float = 1.0
+    model_imgsz: int = 320
+    conf_threshold: float = 0.45
 
     # -- Smoothing --
-    ema_alpha: float = 0.3                  # 0 = no update, 1 = no smoothing at all
+    ema_alpha: float = 0.3
 
-    # -- Classification thresholds (degrees of DEVIATION from calibrated baseline) --
-    neutral_deviation_deg: float = 8.0      # up to this = still HAPPY
-    sad_deviation_deg: float = 16.0         # beyond this = SAD, between = NEUTRAL
+    # -- Classification thresholds for a combined 0-100 front-view posture score --
+    neutral_score: float = 28.0
+    sad_score: float = 55.0
 
     # -- Serial --
-    serial_port: Optional[str] = None       # e.g. "COM5" or "/dev/ttyUSB0"; None = disabled
+    serial_port: Optional[str] = None
     serial_baud: int = 115200
-    send_min_interval_s: float = 1.0        # avoid spamming the microcontroller
+    send_min_interval_s: float = 1.0
 
-    # -- YOLO26-Pose COCO keypoint indices we use (same 17-point layout as v8/11) --
-    # 0: nose, 3: left ear, 4: right ear, 5: left shoulder, 6: right shoulder,
-    # 11: left hip, 12: right hip
+    # -- YOLOv8-Pose COCO keypoint indices --
+    # 0: nose, 1: left eye, 2: right eye, 3: left ear, 4: right ear,
+    # 5: left shoulder, 6: right shoulder, 11: left hip, 12: right hip
+    KP_NOSE: int = 0
+    KP_L_EYE: int = 1
+    KP_R_EYE: int = 2
     KP_L_EAR: int = 3
     KP_R_EAR: int = 4
     KP_L_SHOULDER: int = 5
@@ -74,55 +77,168 @@ class Config:
 
 
 # --------------------------------------------------------------------------- #
-# Vector / angle math
+# Front-facing posture metrics
 # --------------------------------------------------------------------------- #
 
-def angle_from_vertical(p_top: np.ndarray, p_bottom: np.ndarray) -> float:
+@dataclass
+class FrontPostureMetrics:
     """
-    Angle (degrees) between the vector p_bottom->p_top and the true vertical (0,-1)
-    in image coordinates (y grows downward).
-
-    0 deg  = perfectly vertical (upright)
-    +/-90  = fully horizontal
-
-    Sign convention: positive = leaning "forward" in +x image direction,
-    negative = leaning "backward" in -x direction. Which physical direction
-    that corresponds to depends on which way the subject faces the camera;
-    calibration removes the need to worry about that.
+    All values are normalized by shoulder width, so they are less sensitive to
+    camera resolution and distance than raw pixel measurements.
     """
-    vec = p_top - p_bottom
-    # Vertical reference vector (pointing up in image space)
-    vertical = np.array([0.0, -1.0])
-    vec_norm = vec / (np.linalg.norm(vec) + 1e-8)
-    dot = np.clip(np.dot(vec_norm, vertical), -1.0, 1.0)
-    angle = math.degrees(math.acos(dot))
-    # signed via x-component of the vector
-    if vec[0] < 0:
-        angle = -angle
-    return angle
+
+    neck_height: float          # head center to shoulder center vertical gap
+    shoulder_slope: float       # left/right shoulder height mismatch
+    head_tilt: float            # left/right eye or ear height mismatch
+    center_shift: float         # head center x offset from shoulder center
+    hip_shift: float            # shoulder center x offset from hip center
+    shoulder_width_px: float
 
 
-def pick_side(keypoints: np.ndarray, confs: np.ndarray, cfg: Config
-              ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+@dataclass
+class PostureReading:
+    metrics: Optional[FrontPostureMetrics]
+    score: Optional[float] = None
+    compression_pct: Optional[float] = None
+
+
+@dataclass
+class Baseline:
+    metrics: Optional[FrontPostureMetrics] = None
+    calibrated: bool = False
+
+    def set(self, metrics: FrontPostureMetrics):
+        self.metrics = metrics
+        self.calibrated = True
+
+
+def point_visible(confs: np.ndarray, idx: int, cfg: Config) -> bool:
+    return idx < len(confs) and confs[idx] >= cfg.conf_threshold
+
+
+def midpoint(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    return (a + b) / 2.0
+
+
+def normalized_vertical_gap(top: np.ndarray, bottom: np.ndarray, scale: float) -> float:
+    return abs(float(bottom[1] - top[1])) / scale
+
+
+def normalized_x_gap(a: np.ndarray, b: np.ndarray, scale: float) -> float:
+    return abs(float(a[0] - b[0])) / scale
+
+
+def normalized_y_gap(a: np.ndarray, b: np.ndarray, scale: float) -> float:
+    return abs(float(a[1] - b[1])) / scale
+
+
+def choose_head_center(keypoints: np.ndarray, confs: np.ndarray, cfg: Config) -> Optional[Tuple[np.ndarray, str]]:
     """
-    From a side-view webcam, only one side of the body (L or R) will be visible
-    with high confidence. Pick whichever side (ear/shoulder/hip) is most confident.
-    Returns (ear_xy, shoulder_xy, hip_xy) or None if not enough confidence.
+    Prefer ears because they line up naturally with shoulder height. Fall back to
+    eyes, then nose, because front-facing webcams often lose ears under hair or
+    headphones.
     """
-    left_idxs = (cfg.KP_L_EAR, cfg.KP_L_SHOULDER, cfg.KP_L_HIP)
-    right_idxs = (cfg.KP_R_EAR, cfg.KP_R_SHOULDER, cfg.KP_R_HIP)
+    if point_visible(confs, cfg.KP_L_EAR, cfg) and point_visible(confs, cfg.KP_R_EAR, cfg):
+        return midpoint(keypoints[cfg.KP_L_EAR], keypoints[cfg.KP_R_EAR]), "ears"
 
-    left_conf = confs[list(left_idxs)].mean()
-    right_conf = confs[list(right_idxs)].mean()
+    if point_visible(confs, cfg.KP_L_EYE, cfg) and point_visible(confs, cfg.KP_R_EYE, cfg):
+        return midpoint(keypoints[cfg.KP_L_EYE], keypoints[cfg.KP_R_EYE]), "eyes"
 
-    chosen_idxs = left_idxs if left_conf >= right_conf else right_idxs
-    chosen_conf = max(left_conf, right_conf)
+    if point_visible(confs, cfg.KP_NOSE, cfg):
+        return keypoints[cfg.KP_NOSE], "nose"
 
-    if chosen_conf < cfg.conf_threshold:
+    return None
+
+
+def extract_front_posture_metrics(
+    keypoints: np.ndarray,
+    confs: np.ndarray,
+    cfg: Config,
+) -> Optional[Tuple[FrontPostureMetrics, Dict[str, np.ndarray]]]:
+    required = (cfg.KP_L_SHOULDER, cfg.KP_R_SHOULDER)
+    if not all(point_visible(confs, idx, cfg) for idx in required):
         return None
 
-    ear, shoulder, hip = (keypoints[i] for i in chosen_idxs)
-    return ear, shoulder, hip
+    head_pick = choose_head_center(keypoints, confs, cfg)
+    if head_pick is None:
+        return None
+
+    head_center, head_source = head_pick
+    left_shoulder = keypoints[cfg.KP_L_SHOULDER]
+    right_shoulder = keypoints[cfg.KP_R_SHOULDER]
+    shoulder_center = midpoint(left_shoulder, right_shoulder)
+    shoulder_width_px = float(np.linalg.norm(left_shoulder - right_shoulder))
+
+    if shoulder_width_px < 20:
+        return None
+
+    head_tilt = 0.0
+    if point_visible(confs, cfg.KP_L_EAR, cfg) and point_visible(confs, cfg.KP_R_EAR, cfg):
+        head_tilt = normalized_y_gap(keypoints[cfg.KP_L_EAR], keypoints[cfg.KP_R_EAR], shoulder_width_px)
+    elif point_visible(confs, cfg.KP_L_EYE, cfg) and point_visible(confs, cfg.KP_R_EYE, cfg):
+        head_tilt = normalized_y_gap(keypoints[cfg.KP_L_EYE], keypoints[cfg.KP_R_EYE], shoulder_width_px)
+
+    hip_center = None
+    hip_shift = 0.0
+    if point_visible(confs, cfg.KP_L_HIP, cfg) and point_visible(confs, cfg.KP_R_HIP, cfg):
+        hip_center = midpoint(keypoints[cfg.KP_L_HIP], keypoints[cfg.KP_R_HIP])
+        hip_shift = normalized_x_gap(shoulder_center, hip_center, shoulder_width_px)
+
+    metrics = FrontPostureMetrics(
+        neck_height=normalized_vertical_gap(head_center, shoulder_center, shoulder_width_px),
+        shoulder_slope=normalized_y_gap(left_shoulder, right_shoulder, shoulder_width_px),
+        head_tilt=head_tilt,
+        center_shift=normalized_x_gap(head_center, shoulder_center, shoulder_width_px),
+        hip_shift=hip_shift,
+        shoulder_width_px=shoulder_width_px,
+    )
+
+    tracking_points = {
+        "head": head_center,
+        "left_shoulder": left_shoulder,
+        "right_shoulder": right_shoulder,
+        "shoulder_center": shoulder_center,
+        "head_source": head_source,
+    }
+    if hip_center is not None:
+        tracking_points["hip_center"] = hip_center
+        tracking_points["left_hip"] = keypoints[cfg.KP_L_HIP]
+        tracking_points["right_hip"] = keypoints[cfg.KP_R_HIP]
+
+    return metrics, tracking_points
+
+
+def score_front_posture(metrics: FrontPostureMetrics, baseline: FrontPostureMetrics) -> Tuple[float, float]:
+    """
+    Build a practical front-facing posture score.
+
+    The strongest signal is neck compression: if head-to-shoulder height gets
+    shorter than the calibrated upright baseline, the student is probably
+    dropping the head, hunching, or collapsing the shoulders. Side-to-side tilt
+    and center shifts catch leaning and asymmetry.
+    """
+    compression = max(0.0, (baseline.neck_height - metrics.neck_height) / max(baseline.neck_height, 1e-6))
+    shoulder_slope_extra = max(0.0, metrics.shoulder_slope - baseline.shoulder_slope)
+    head_tilt_extra = max(0.0, metrics.head_tilt - baseline.head_tilt)
+    center_shift_extra = max(0.0, metrics.center_shift - baseline.center_shift)
+    hip_shift_extra = max(0.0, metrics.hip_shift - baseline.hip_shift)
+
+    score = (
+        compression * 95.0
+        + shoulder_slope_extra * 95.0
+        + head_tilt_extra * 85.0
+        + center_shift_extra * 70.0
+        + hip_shift_extra * 45.0
+    )
+    return min(score, 100.0), compression * 100.0
+
+
+def classify_state(score: float, cfg: Config) -> str:
+    if score <= cfg.neutral_score:
+        return "HAPPY"
+    if score <= cfg.sad_score:
+        return "NEUTRAL"
+    return "SAD"
 
 
 # --------------------------------------------------------------------------- #
@@ -130,7 +246,7 @@ def pick_side(keypoints: np.ndarray, confs: np.ndarray, cfg: Config
 # --------------------------------------------------------------------------- #
 
 class EMASmoother:
-    """Simple exponential moving average for scalar values (e.g. angles)."""
+    """Simple exponential moving average for scalar values."""
 
     def __init__(self, alpha: float):
         self.alpha = alpha
@@ -147,20 +263,42 @@ class EMASmoother:
         self.value = None
 
 
-# --------------------------------------------------------------------------- #
-# Calibration
-# --------------------------------------------------------------------------- #
+class MetricSmoother:
+    """EMA smoothing for the group of front-facing posture metrics."""
 
-@dataclass
-class Baseline:
-    neck_angle: Optional[float] = None      # ear-shoulder vector vs vertical
-    trunk_angle: Optional[float] = None     # shoulder-hip vector vs vertical
-    calibrated: bool = False
+    def __init__(self, alpha: float):
+        self.smoothers = {
+            "neck_height": EMASmoother(alpha),
+            "shoulder_slope": EMASmoother(alpha),
+            "head_tilt": EMASmoother(alpha),
+            "center_shift": EMASmoother(alpha),
+            "hip_shift": EMASmoother(alpha),
+            "shoulder_width_px": EMASmoother(alpha),
+        }
 
-    def set(self, neck_angle: float, trunk_angle: float):
-        self.neck_angle = neck_angle
-        self.trunk_angle = trunk_angle
-        self.calibrated = True
+    def update(self, metrics: FrontPostureMetrics) -> FrontPostureMetrics:
+        values = {
+            name: smoother.update(getattr(metrics, name))
+            for name, smoother in self.smoothers.items()
+        }
+        return FrontPostureMetrics(**values)
+
+    def reset(self):
+        for smoother in self.smoothers.values():
+            smoother.reset()
+
+    @property
+    def value(self) -> Optional[FrontPostureMetrics]:
+        if self.smoothers["neck_height"].value is None:
+            return None
+        return FrontPostureMetrics(
+            neck_height=self.smoothers["neck_height"].value,
+            shoulder_slope=self.smoothers["shoulder_slope"].value,
+            head_tilt=self.smoothers["head_tilt"].value,
+            center_shift=self.smoothers["center_shift"].value,
+            hip_shift=self.smoothers["hip_shift"].value,
+            shoulder_width_px=self.smoothers["shoulder_width_px"].value,
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -180,7 +318,7 @@ class SerialLink:
         if self.enabled:
             try:
                 self.conn = serial.Serial(port, baud, timeout=1)
-                time.sleep(2)  # allow ESP32/Arduino to reset after port open
+                time.sleep(2)
                 print(f"[serial] Connected on {port} @ {baud} baud")
             except Exception as e:
                 print(f"[serial] Failed to open {port}: {e}. Running without hardware output.")
@@ -188,7 +326,6 @@ class SerialLink:
 
     def send_state(self, state: str):
         now = time.time()
-        # Only send on state change OR after min interval, to avoid flooding the MCU
         if state == self._last_state and (now - self._last_sent) < self.min_interval_s:
             return
         self._last_sent = now
@@ -200,32 +337,11 @@ class SerialLink:
             except Exception as e:
                 print(f"[serial] Write failed: {e}")
         else:
-            # Placeholder output when no hardware attached
             print(f"[serial->cube] {state}")
 
     def close(self):
         if self.enabled and self.conn is not None:
             self.conn.close()
-
-
-# --------------------------------------------------------------------------- #
-# Posture classification
-# --------------------------------------------------------------------------- #
-
-def classify_state(neck_dev: float, trunk_dev: float, cfg: Config) -> str:
-    """
-    Combine forward-head (neck) and slouch (trunk) deviations from baseline
-    into a single comfort state. Worst-of-two-signals logic: whichever
-    metric is most out of range drives the state.
-    """
-    worst_dev = max(abs(neck_dev), abs(trunk_dev))
-
-    if worst_dev <= cfg.neutral_deviation_deg:
-        return "HAPPY"
-    elif worst_dev <= cfg.sad_deviation_deg:
-        return "NEUTRAL"
-    else:
-        return "SAD"
 
 
 # --------------------------------------------------------------------------- #
@@ -242,64 +358,66 @@ class PostureMonitor:
         if not self.cap.isOpened():
             raise RuntimeError(f"Could not open camera index {cfg.camera_index}")
 
-        self.neck_smoother = EMASmoother(cfg.ema_alpha)
-        self.trunk_smoother = EMASmoother(cfg.ema_alpha)
+        self.metric_smoother = MetricSmoother(cfg.ema_alpha)
+        self.score_smoother = EMASmoother(cfg.ema_alpha)
         self.baseline = Baseline()
         self.serial_link = SerialLink(cfg.serial_port, cfg.serial_baud, cfg.send_min_interval_s)
 
         self._last_sample_t = 0.0
         self._last_state = "NEUTRAL"
         self._last_tracking_points = None
-        # small rolling history purely for on-screen debug/plotting if desired
+        self._last_reading = PostureReading(metrics=None)
         self._history = deque(maxlen=100)
 
     # ---------------------------------------------------------------- #
-    def _extract_angles(self, frame) -> Optional[Tuple[float, float]]:
-        """Run pose model on one frame, return (neck_angle, trunk_angle) or None."""
+    def _extract_metrics(self, frame) -> Optional[Tuple[FrontPostureMetrics, Dict[str, np.ndarray]]]:
+        """Run pose model on one frame, return front-facing metrics or None."""
         results = self.model(frame, verbose=False, imgsz=self.cfg.model_imgsz)[0]
 
         if results.keypoints is None or len(results.keypoints.xy) == 0:
             self._last_tracking_points = None
             return None
 
-        # Use the first detected person (assume single-student desk setup)
-        keypoints = results.keypoints.xy[0].cpu().numpy()      # (17, 2)
-        confs = results.keypoints.conf[0].cpu().numpy()        # (17,)
+        keypoints = results.keypoints.xy[0].cpu().numpy()
+        confs = results.keypoints.conf[0].cpu().numpy()
 
-        picked = pick_side(keypoints, confs, self.cfg)
-        if picked is None:
+        extracted = extract_front_posture_metrics(keypoints, confs, self.cfg)
+        if extracted is None:
             self._last_tracking_points = None
             return None
 
-        ear, shoulder, hip = picked
-        self._last_tracking_points = {
-            "ear": ear,
-            "shoulder": shoulder,
-            "hip": hip,
-        }
-
-        neck_angle = angle_from_vertical(ear, shoulder)     # forward head posture
-        trunk_angle = angle_from_vertical(shoulder, hip)    # slouch
-
-        return neck_angle, trunk_angle
+        metrics, tracking_points = extracted
+        self._last_tracking_points = tracking_points
+        return metrics, tracking_points
 
     # ---------------------------------------------------------------- #
-    def _handle_calibration(self, neck_angle: float, trunk_angle: float):
-        self.baseline.set(neck_angle, trunk_angle)
-        self.neck_smoother.reset()
-        self.trunk_smoother.reset()
-        print(f"[calibration] Baseline set -> neck: {neck_angle:.1f} deg, "
-              f"trunk: {trunk_angle:.1f} deg")
+    def _handle_calibration(self, metrics: FrontPostureMetrics):
+        self.baseline.set(metrics)
+        self.metric_smoother.reset()
+        self.score_smoother.reset()
+        print(
+            "[calibration] Baseline set -> "
+            f"neck height: {metrics.neck_height:.2f}, "
+            f"shoulder slope: {metrics.shoulder_slope:.2f}, "
+            f"head tilt: {metrics.head_tilt:.2f}, "
+            f"center shift: {metrics.center_shift:.2f}"
+        )
 
     # ---------------------------------------------------------------- #
-    def _draw_overlay(self, frame, neck_angle, trunk_angle, state):
+    def _draw_overlay(self, frame, reading: PostureReading, state: str):
         frame = self._draw_tracking_overlay(frame)
+
+        metrics = reading.metrics
+        score = reading.score
+        compression = reading.compression_pct
 
         y = 30
         lines = [
             f"State: {state}",
-            f"Neck angle: {neck_angle:.1f} deg" if neck_angle is not None else "Neck angle: --",
-            f"Trunk angle: {trunk_angle:.1f} deg" if trunk_angle is not None else "Trunk angle: --",
+            f"Posture score: {score:.0f}/100" if score is not None else "Posture score: --",
+            f"Neck compression: {compression:.0f}%" if compression is not None else "Neck compression: --",
+            f"Shoulder slope: {metrics.shoulder_slope:.2f}" if metrics is not None else "Shoulder slope: --",
+            f"Head/torso shift: {metrics.center_shift:.2f}" if metrics is not None else "Head/torso shift: --",
             "Baseline: SET" if self.baseline.calibrated else "Baseline: NOT SET (press 'c')",
         ]
         color = {"HAPPY": (0, 200, 0), "NEUTRAL": (0, 200, 200), "SAD": (0, 0, 220)}.get(state, (255, 255, 255))
@@ -310,26 +428,35 @@ class PostureMonitor:
 
     # ---------------------------------------------------------------- #
     def _draw_tracking_overlay(self, frame):
-        """Draw the keypoints and posture vectors used for angle calculation."""
-        if self._last_tracking_points is None:
+        """Draw front-facing keypoints and posture guides."""
+        points = self._last_tracking_points
+        if points is None:
             return frame
 
-        ear = tuple(self._last_tracking_points["ear"].astype(int))
-        shoulder = tuple(self._last_tracking_points["shoulder"].astype(int))
-        hip = tuple(self._last_tracking_points["hip"].astype(int))
+        head = tuple(points["head"].astype(int))
+        left_shoulder = tuple(points["left_shoulder"].astype(int))
+        right_shoulder = tuple(points["right_shoulder"].astype(int))
+        shoulder_center = tuple(points["shoulder_center"].astype(int))
 
-        cv2.line(frame, shoulder, ear, (255, 180, 0), 3)
-        cv2.line(frame, hip, shoulder, (255, 180, 0), 3)
+        cv2.line(frame, left_shoulder, right_shoulder, (255, 180, 0), 3)
+        cv2.line(frame, shoulder_center, head, (255, 180, 0), 3)
+        cv2.line(frame, (head[0], shoulder_center[1]), shoulder_center, (180, 180, 180), 2)
 
-        vertical_top = (shoulder[0], max(0, shoulder[1] - 90))
-        cv2.line(frame, shoulder, vertical_top, (180, 180, 180), 2)
+        if "left_hip" in points and "right_hip" in points:
+            left_hip = tuple(points["left_hip"].astype(int))
+            right_hip = tuple(points["right_hip"].astype(int))
+            hip_center = tuple(points["hip_center"].astype(int))
+            cv2.line(frame, left_hip, right_hip, (0, 180, 255), 2)
+            cv2.line(frame, hip_center, shoulder_center, (0, 180, 255), 2)
+            cv2.circle(frame, hip_center, 6, (0, 180, 255), -1)
 
-        points = [
-            ("Ear", ear, (0, 255, 255)),
-            ("Shoulder", shoulder, (255, 0, 255)),
-            ("Hip", hip, (0, 180, 255)),
+        draw_points = [
+            ("Head", head, (0, 255, 255)),
+            ("L Shoulder", left_shoulder, (255, 0, 255)),
+            ("R Shoulder", right_shoulder, (255, 0, 255)),
+            ("Shoulders", shoulder_center, (255, 180, 0)),
         ]
-        for label, point, color in points:
+        for label, point, color in draw_points:
             cv2.circle(frame, point, 7, color, -1)
             cv2.circle(frame, point, 10, (0, 0, 0), 2)
             cv2.putText(
@@ -342,11 +469,22 @@ class PostureMonitor:
                 2,
             )
 
+        source = points.get("head_source", "head")
+        cv2.putText(
+            frame,
+            f"Head source: {source}",
+            (10, frame.shape[0] - 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (230, 230, 230),
+            2,
+        )
         return frame
 
     # ---------------------------------------------------------------- #
     def run(self):
-        print("Press 'c' to calibrate baseline (sit upright first), 'q' to quit.")
+        print("Front-facing posture mode.")
+        print("Sit upright with face and shoulders visible, press 'c' to calibrate, 'q' to quit.")
         try:
             while True:
                 ok, frame = self.cap.read()
@@ -358,48 +496,44 @@ class PostureMonitor:
                 now = time.time()
                 do_inference = (now - self._last_sample_t) >= self.cfg.sample_interval_s
 
-                neck_angle_raw = trunk_angle_raw = None
-                neck_smoothed = self.neck_smoother.value
-                trunk_smoothed = self.trunk_smoother.value
-
                 if do_inference:
                     self._last_sample_t = now
-                    angles = self._extract_angles(frame)
-                    if angles is not None:
-                        neck_angle_raw, trunk_angle_raw = angles
-                        neck_smoothed = self.neck_smoother.update(neck_angle_raw)
-                        trunk_smoothed = self.trunk_smoother.update(trunk_angle_raw)
+                    extracted = self._extract_metrics(frame)
+                    if extracted is not None:
+                        metrics, _ = extracted
+                        smoothed_metrics = self.metric_smoother.update(metrics)
+                        score = None
+                        compression = None
 
-                        if self.baseline.calibrated:
-                            neck_dev = neck_smoothed - self.baseline.neck_angle
-                            trunk_dev = trunk_smoothed - self.baseline.trunk_angle
-                            state = classify_state(neck_dev, trunk_dev, self.cfg)
+                        if self.baseline.calibrated and self.baseline.metrics is not None:
+                            raw_score, compression = score_front_posture(smoothed_metrics, self.baseline.metrics)
+                            score = self.score_smoother.update(raw_score)
+                            state = classify_state(score, self.cfg)
                             self._last_state = state
-                            self._history.append((now, neck_dev, trunk_dev, state))
+                            self._history.append((now, score, compression, state))
                             self.serial_link.send_state(state)
                         else:
-                            # No baseline yet: report NEUTRAL as a safe default
                             self._last_state = "NEUTRAL"
 
-                # Overlay + display every rendered frame (cheap), inference only every N seconds
-                frame = self._draw_overlay(
-                    frame,
-                    neck_smoothed,
-                    trunk_smoothed,
-                    self._last_state,
-                )
+                        self._last_reading = PostureReading(
+                            metrics=smoothed_metrics,
+                            score=score,
+                            compression_pct=compression,
+                        )
+
+                frame = self._draw_overlay(frame, self._last_reading, self._last_state)
                 cv2.imshow("Posture Monitor (press c=calibrate, q=quit)", frame)
 
                 key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
+                if key == ord("q"):
                     break
-                elif key == ord('c'):
-                    # Force an immediate inference pass for calibration, don't wait for sample timer
-                    angles = self._extract_angles(frame)
-                    if angles is not None:
-                        self._handle_calibration(*angles)
+                if key == ord("c"):
+                    extracted = self._extract_metrics(frame)
+                    if extracted is not None:
+                        metrics, _ = extracted
+                        self._handle_calibration(metrics)
                     else:
-                        print("[calibration] No confident keypoints detected — adjust position and retry.")
+                        print("[calibration] Need a clear front view of face and both shoulders.")
 
         finally:
             self.cap.release()
@@ -412,8 +546,8 @@ class PostureMonitor:
 # --------------------------------------------------------------------------- #
 
 def parse_args() -> Config:
-    p = argparse.ArgumentParser(description="Posture monitor backend for Stats & Emotion Cube")
-    p.add_argument("--model", default="yolo26n-pose.pt")
+    p = argparse.ArgumentParser(description="Front-facing posture monitor backend for Stats & Emotion Cube")
+    p.add_argument("--model", default="yolov8n-pose.pt")
     p.add_argument("--camera", type=int, default=0)
     p.add_argument("--interval", type=float, default=1.0, help="Seconds between inference samples")
     p.add_argument("--imgsz", type=int, default=320, help="YOLO inference image size; lower is faster")
