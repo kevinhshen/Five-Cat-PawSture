@@ -198,6 +198,18 @@ def extract_front_posture_metrics(
     if eye_width_px < 8:
         return None
 
+    # Geometry check 1.5: Profile Face Check
+    # If the face turns sideways, the 2D distance between the eyes collapses,
+    # but the nose sticks out. We reject the front view if the eyes are squished.
+    if point_visible(confs, cfg.KP_NOSE, cfg):
+        nose = keypoints[cfg.KP_NOSE]
+        nose_to_eye_dist = float(np.linalg.norm(nose - eye_center))
+        
+        # If the gap between eyes is smaller than the distance to the nose, 
+        # it is physically impossible for the user to be facing forward.
+        if eye_width_px < (nose_to_eye_dist * 0.9):
+            return None
+
     # Geometry check 1: Ratio of eye span to shoulder span
     if (eye_width_px / shoulder_width_px) < cfg.front_min_eye_shoulder_ratio:
         return None
