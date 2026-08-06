@@ -190,11 +190,13 @@ class EMASmoother:
 class Baseline:
     neck_angle: Optional[float] = None      # ear-shoulder vector vs vertical
     trunk_angle: Optional[float] = None     # shoulder-hip vector vs vertical
+    track_id: Optional[int] = None          # Tracked ID of the main student
     calibrated: bool = False
 
-    def set(self, neck_angle: float, trunk_angle: float):
+    def set(self, neck_angle: float, trunk_angle: float, track_id: Optional[int] = None):
         self.neck_angle = neck_angle
         self.trunk_angle = trunk_angle
+        self.track_id = track_id
         self.calibrated = True
 
 
@@ -334,20 +336,38 @@ class PostureMonitor:
         self._history = deque(maxlen=100)
 
     # ---------------------------------------------------------------- #
-    def _extract_angles(self, frame):
+    def _extract_angles(self, frame, target_id: Optional[int] = None):
         """
-        Run pose model on one frame.
-        Returns (neck_angle, trunk_angle, (ear, shoulder, hip)) or None.
-        The points are returned so the caller can draw them for debugging.
+        Run pose model with persistent tracking on one frame.
+        Returns (neck_angle, trunk_angle, (ear, shoulder, hip), detected_track_id) or None.
         """
-        results = self.model(frame, verbose=False)[0]
+        # Use track() instead of call(), persist=True ensures IDs stay assigned across frames
+        results = self.model.track(frame, persist=True, tracker="bytetrack.yaml", verbose=False)[0]
 
         if results.keypoints is None or len(results.keypoints.xy) == 0:
             return None
 
-        # Use the first detected person (assume single-student desk setup)
-        keypoints = results.keypoints.xy[0].cpu().numpy()      # (17, 2)
-        confs = results.keypoints.conf[0].cpu().numpy()        # (17,)
+        # Check if tracking IDs are available from ByteTrack
+        track_ids = results.boxes.id.cpu().numpy().astype(int) if results.boxes.id is not None else None
+        
+        target_idx = None
+
+        if target_id is not None and track_ids is not None:
+            # If we already have a locked track_id, find its index in current detections
+            matching_indices = np.where(track_ids == target_id)[0]
+            if len(matching_indices) > 0:
+                target_idx = matching_indices[0]
+
+        # If target_id wasn't provided or lost, fallback/default to largest box (closest student)
+        if target_idx is None:
+            boxes = results.boxes.xyxy.cpu().numpy()
+            areas = (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
+            target_idx = int(np.argmax(areas))
+
+        current_track_id = track_ids[target_idx] if track_ids is not None else None
+
+        keypoints = results.keypoints.xy[target_idx].cpu().numpy()     # (17, 2)
+        confs = results.keypoints.conf[target_idx].cpu().numpy()       # (17,)
 
         picked = pick_side(keypoints, confs, self.cfg)
         if picked is None:
@@ -358,41 +378,41 @@ class PostureMonitor:
         neck_angle = angle_from_vertical(ear, shoulder)     # forward head posture
         trunk_angle = angle_from_vertical(shoulder, hip)    # slouch
 
-        return neck_angle, trunk_angle, (ear, shoulder, hip)
+        return neck_angle, trunk_angle, (ear, shoulder, hip), current_track_id
 
     # ---------------------------------------------------------------- #
     def _sample_burst(self):
         """
         Grab several frames in quick succession and average their angles.
-        This smooths out a single bad-detection frame, which is the most
-        common cause of a one-off false SAD/HAPPY reading.
-        Returns (neck_angle, trunk_angle, last_points) or None if nothing usable.
+        Returns (neck_angle, trunk_angle, last_points, last_track_id) or None.
         """
-        neck_vals, trunk_vals, last_points = [], [], None
+        neck_vals, trunk_vals, last_points, last_track_id = [], [], None, None
 
         for _ in range(self.cfg.burst_frames):
             ok, frame = self.cap.read()
             if not ok:
                 continue
-            result = self._extract_angles(frame)
+            # Pass our saved target ID to stick to the calibrated user
+            result = self._extract_angles(frame, target_id=self.baseline.track_id)
             if result is not None:
-                neck_angle, trunk_angle, points = result
+                neck_angle, trunk_angle, points, track_id = result
                 neck_vals.append(neck_angle)
                 trunk_vals.append(trunk_angle)
                 last_points = points
+                last_track_id = track_id
             time.sleep(self.cfg.burst_delay_s)
 
         if not neck_vals:
             return None
 
-        return float(np.mean(neck_vals)), float(np.mean(trunk_vals)), last_points
+        return float(np.mean(neck_vals)), float(np.mean(trunk_vals)), last_points, last_track_id
 
     # ---------------------------------------------------------------- #
-    def _handle_calibration(self, neck_angle: float, trunk_angle: float):
-        self.baseline.set(neck_angle, trunk_angle)
+    def _handle_calibration(self, neck_angle: float, trunk_angle: float, track_id: Optional[int]):
+        self.baseline.set(neck_angle, trunk_angle, track_id)
         self.neck_smoother.reset()
         self.trunk_smoother.reset()
-        print(f"[calibration] Baseline set -> neck: {neck_angle:.1f} deg, "
+        print(f"[calibration] Baseline set for User ID #{track_id} -> neck: {neck_angle:.1f} deg, "
               f"trunk: {trunk_angle:.1f} deg")
 
     # ---------------------------------------------------------------- #
@@ -400,6 +420,7 @@ class PostureMonitor:
         y = 30
         lines = [
             f"State: {state}",
+            f"Tracking ID: #{self.baseline.track_id}" if self.baseline.track_id is not None else "Tracking ID: Auto (Largest)",
             f"Neck angle: {neck_angle:.1f} deg" if neck_angle is not None else "Neck angle: --",
             f"Trunk angle: {trunk_angle:.1f} deg" if trunk_angle is not None else "Trunk angle: --",
             "Baseline: SET" if self.baseline.calibrated else "Baseline: NOT SET (press 'c')",
@@ -431,7 +452,8 @@ class PostureMonitor:
                     self._last_sample_t = now
                     result = self._sample_burst()  # averages a few frames, reduces single-frame noise
                     if result is not None:
-                        neck_angle_raw, trunk_angle_raw, points = result
+                        # Unpack 4 values now (includes track_id)
+                        neck_angle_raw, trunk_angle_raw, points, track_id = result
                         self._last_points = points
                         neck_smoothed = self.neck_smoother.update(neck_angle_raw)
                         trunk_smoothed = self.trunk_smoother.update(trunk_angle_raw)
@@ -477,12 +499,12 @@ class PostureMonitor:
                 if key == ord('q'):
                     break
                 elif key == ord('c'):
-                    # Force an immediate inference pass for calibration, don't wait for sample timer
-                    result = self._extract_angles(frame)
+                    # Passing target_id=None grabs the closest student and locks their track ID
+                    result = self._extract_angles(frame, target_id=None)
                     if result is not None:
-                        neck_angle, trunk_angle, points = result
+                        neck_angle, trunk_angle, points, track_id = result
                         self._last_points = points
-                        self._handle_calibration(neck_angle, trunk_angle)
+                        self._handle_calibration(neck_angle, trunk_angle, track_id)
                     else:
                         print("[calibration] No confident keypoints detected — adjust position and retry.")
 
@@ -513,7 +535,6 @@ def parse_args() -> Config:
         serial_port=args.port,
         serial_baud=args.baud,
     )
-
 
 if __name__ == "__main__":
     cfg = parse_args()
