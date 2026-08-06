@@ -4,19 +4,9 @@ PawSture
 Host-side posture monitoring backend for the "Stats & Emotion Cube" project.
 
 Pipeline:
-    Webcam -> YOLOv8-Pose keypoints -> automatic front/side view selection
-    -> calibrated view-specific posture metrics -> EMA smoothing -> state classification
-    -> Serial to microcontroller
-
-Hardware assumptions:
-    - One webcam can see the student from the front or either side.
-    - Front mode needs both eyes and both shoulders; side mode needs an ear,
-      shoulder, and hip on one visible side.
-    - Arduino listening on a serial port for single-word state strings.
-
-Controls:
-    'c' -> calibrate the active front or side baseline (sit upright first)
-    'q' -> quit
+    Webcam -> YOLOv8-Pose keypoints -> persistent object tracking -> target student filtering
+    -> automatic front/side view selection -> calibrated view-specific posture metrics
+    -> EMA smoothing -> state classification -> Serial to microcontroller
 
 Dependencies:
     pip install ultralytics opencv-python pyserial numpy
@@ -56,11 +46,12 @@ class Config:
     ema_alpha: float = 0.3
 
     # -- Front-view geometry checks --
-    # In side view, YOLO may place both eye keypoints on the same visible eye.
-    # A real front view should have a meaningful eye span compared with shoulders.
-    front_min_eye_shoulder_ratio: float = 0.12
+    # In side/angled views, shoulder width collapses relative to the eyes or vice-versa.
+    front_min_eye_shoulder_ratio: float = 0.16
+    front_max_eye_tilt_ratio: float = 0.25
+    front_min_shoulder_head_ratio: float = 2.2  # Shoulders must be at least 2.2x eye width for a valid front view
 
-    # -- Classification thresholds for a combined 0-100 front-view posture score --
+    # -- Classification thresholds for front-view posture score (0-100) --
     neutral_score: float = 28.0
     sad_score: float = 55.0
 
@@ -68,11 +59,10 @@ class Config:
     side_neutral_deviation_deg: float = 10.0
     side_sad_deviation_deg: float = 20.0
 
-    # -- Automatic view selection --
-    # A new view must be more confident for several inference samples before
-    # becoming active. This prevents flickering while the user turns around.
-    switch_confirm_samples: int = 3
-    switch_margin: float = 0.08
+    # -- Automatic view selection & hysteresis --
+    switch_confirm_samples: int = 5      # Consecutive samples required before changing views
+    switch_margin: float = 0.15          # Lead confidence needed to flip views
+    side_mode_bias: float = 0.15         # Extra confidence bias given to keep SIDE mode active
 
     # -- Serial --
     serial_port: Optional[str] = None
@@ -80,8 +70,6 @@ class Config:
     send_min_interval_s: float = 1.0
 
     # -- YOLOv8-Pose COCO keypoint indices --
-    # 0: nose, 1: left eye, 2: right eye, 3: left ear, 4: right ear,
-    # 5: left shoulder, 6: right shoulder, 11: left hip, 12: right hip
     KP_NOSE: int = 0
     KP_L_EYE: int = 1
     KP_R_EYE: int = 2
@@ -99,18 +87,13 @@ class Config:
 
 @dataclass
 class FrontPostureMetrics:
-    """
-    Most values are normalized by calibrated eye width or shoulder width, so
-    they are less sensitive to camera resolution and distance than raw pixels.
-    """
-
-    eye_width_px: float         # distance between eyes; useful as a depth proxy
-    eye_drop: float             # eye center y relative to shoulder center
-    eye_tilt: float             # left/right eye height mismatch
-    eye_shift: float            # eye center x offset from shoulder center
-    neck_height: float          # head center to shoulder center vertical gap
-    shoulder_slope: float       # low-weight signal; pose shoulders can be noisy
-    hip_shift: float            # shoulder center x offset from hip center
+    eye_width_px: float
+    eye_drop: float
+    eye_tilt: float
+    eye_shift: float
+    neck_height: float
+    shoulder_slope: float
+    hip_shift: float
     shoulder_width_px: float
 
 
@@ -166,15 +149,10 @@ def normalized_y_gap(a: np.ndarray, b: np.ndarray, scale: float) -> float:
 def choose_eye_pair(keypoints: np.ndarray, confs: np.ndarray, cfg: Config) -> Optional[Tuple[np.ndarray, np.ndarray]]:
     if point_visible(confs, cfg.KP_L_EYE, cfg) and point_visible(confs, cfg.KP_R_EYE, cfg):
         return keypoints[cfg.KP_L_EYE], keypoints[cfg.KP_R_EYE]
-
     return None
 
 
 def choose_head_center(keypoints: np.ndarray, confs: np.ndarray, cfg: Config) -> Optional[Tuple[np.ndarray, str]]:
-    """
-    Ears line up naturally with shoulder height, but eyes are usually more stable
-    in a front-facing webcam. Nose is only a fallback for drawing/tracking.
-    """
     eye_pair = choose_eye_pair(keypoints, confs, cfg)
     if eye_pair is not None:
         return midpoint(*eye_pair), "eyes"
@@ -219,7 +197,20 @@ def extract_front_posture_metrics(
     eye_width_px = float(np.linalg.norm(left_eye - right_eye))
     if eye_width_px < 8:
         return None
+
+    # Geometry check 1: Ratio of eye span to shoulder span
     if (eye_width_px / shoulder_width_px) < cfg.front_min_eye_shoulder_ratio:
+        return None
+
+    # Geometry check 2: Eye vertical mismatch (tilt check)
+    eye_tilt = normalized_y_gap(left_eye, right_eye, eye_width_px)
+    if eye_tilt > cfg.front_max_eye_tilt_ratio:
+        return None
+
+    # Geometry check 3: Unusual shoulder length check relative to eye width
+    # When turning sideways, shoulder width compresses faster than head width in 2D perspective.
+    shoulder_head_ratio = shoulder_width_px / eye_width_px
+    if shoulder_head_ratio < cfg.front_min_shoulder_head_ratio:
         return None
 
     hip_center = None
@@ -231,7 +222,7 @@ def extract_front_posture_metrics(
     metrics = FrontPostureMetrics(
         eye_width_px=eye_width_px,
         eye_drop=float(eye_center[1] - shoulder_center[1]) / shoulder_width_px,
-        eye_tilt=normalized_y_gap(left_eye, right_eye, eye_width_px),
+        eye_tilt=eye_tilt,
         eye_shift=normalized_x_gap(eye_center, shoulder_center, shoulder_width_px),
         neck_height=normalized_vertical_gap(head_center, shoulder_center, shoulder_width_px),
         shoulder_slope=normalized_y_gap(left_shoulder, right_shoulder, shoulder_width_px),
@@ -258,14 +249,6 @@ def extract_front_posture_metrics(
 
 
 def score_front_posture(metrics: FrontPostureMetrics, baseline: FrontPostureMetrics) -> Tuple[float, float]:
-    """
-    Build a practical front-facing posture score with eye/head tracking as the
-    primary signal. This is not true 3D triangulation, but eye width gives a
-    useful calibrated proxy for moving closer to the camera.
-
-    Shoulder slope is intentionally low-weight because the pose model may move
-    shoulder keypoints slightly when the head tilts.
-    """
     compression = max(0.0, (baseline.neck_height - metrics.neck_height) / max(baseline.neck_height, 1e-6))
     eye_drop_extra = max(0.0, metrics.eye_drop - baseline.eye_drop)
     eye_tilt_extra = max(0.0, metrics.eye_tilt - baseline.eye_tilt)
@@ -299,7 +282,6 @@ def classify_state(score: float, cfg: Config) -> str:
 # --------------------------------------------------------------------------- #
 
 def angle_from_vertical(p_top: np.ndarray, p_bottom: np.ndarray) -> float:
-    """Signed angle of a body segment from vertical in image coordinates."""
     vec = p_top - p_bottom
     vec_norm = vec / (np.linalg.norm(vec) + 1e-8)
     angle = float(np.degrees(np.arccos(np.clip(np.dot(vec_norm, [0.0, -1.0]), -1.0, 1.0))))
@@ -311,12 +293,11 @@ def choose_side_chain(
     confs: np.ndarray,
     cfg: Config,
 ) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray, float, str]]:
-    """Select the more confidently detected ear-shoulder-hip side chain."""
     choices = (
         ("left", (cfg.KP_L_EAR, cfg.KP_L_SHOULDER, cfg.KP_L_HIP)),
         ("right", (cfg.KP_R_EAR, cfg.KP_R_SHOULDER, cfg.KP_R_HIP)),
     )
-    side_name, indices = max(choices, key=lambda choice: float(np.mean(confs[list(choice[1])])) )
+    side_name, indices = max(choices, key=lambda choice: float(np.mean(confs[list(choice[1])])))
     quality = float(np.mean(confs[list(indices)]))
     if quality < cfg.conf_threshold:
         return None
@@ -334,12 +315,10 @@ def side_state(neck_deviation: float, trunk_deviation: float, cfg: Config) -> st
 
 
 # --------------------------------------------------------------------------- #
-# EMA smoothing
+# EMA smoothing & Serial link
 # --------------------------------------------------------------------------- #
 
 class EMASmoother:
-    """Simple exponential moving average for scalar values."""
-
     def __init__(self, alpha: float):
         self.alpha = alpha
         self.value: Optional[float] = None
@@ -356,8 +335,6 @@ class EMASmoother:
 
 
 class MetricSmoother:
-    """EMA smoothing for the group of front-facing posture metrics."""
-
     def __init__(self, alpha: float):
         self.smoothers = {
             "eye_width_px": EMASmoother(alpha),
@@ -381,78 +358,38 @@ class MetricSmoother:
         for smoother in self.smoothers.values():
             smoother.reset()
 
-    @property
-    def value(self) -> Optional[FrontPostureMetrics]:
-        if self.smoothers["neck_height"].value is None:
-            return None
-        return FrontPostureMetrics(
-            eye_width_px=self.smoothers["eye_width_px"].value,
-            eye_drop=self.smoothers["eye_drop"].value,
-            eye_tilt=self.smoothers["eye_tilt"].value,
-            eye_shift=self.smoothers["eye_shift"].value,
-            neck_height=self.smoothers["neck_height"].value,
-            shoulder_slope=self.smoothers["shoulder_slope"].value,
-            hip_shift=self.smoothers["hip_shift"].value,
-            shoulder_width_px=self.smoothers["shoulder_width_px"].value,
-        )
-
-
-# --------------------------------------------------------------------------- #
-# Serial link
-# --------------------------------------------------------------------------- #
 
 def auto_detect_port() -> Optional[str]:
-    """Find a likely Arduino/USB serial port when --port is not supplied."""
     if list_ports is None:
         return None
-
     ports = list(list_ports.comports())
     if not ports:
         return None
-
-    keywords = (
-        "usbmodem",
-        "usbserial",
-        "arduino",
-        "ch340",
-        "wchusbserial",
-        "ttyusb",
-        "ttyacm",
-    )
+    keywords = ("usbmodem", "usbserial", "arduino", "ch340", "wchusbserial", "ttyusb", "ttyacm")
     for port in ports:
         device = port.device.lower()
         description = (port.description or "").lower()
         if any(keyword in device or keyword in description for keyword in keywords):
-            print(f"[serial] Auto-detected port: {port.device} ({port.description})")
             return port.device
+    return ports[0].device if len(ports) == 1 else None
 
-    if len(ports) == 1:
-        print(f"[serial] Only one port available, using it: {ports[0].device}")
-        return ports[0].device
-
-    print("[serial] Could not confidently auto-detect an Arduino port. Use --port to choose one.")
-    return None
 
 class SerialLink:
-    """Thin wrapper around pyserial with graceful no-op fallback."""
-
     def __init__(self, port: Optional[str], baud: int, min_interval_s: float):
         if port is None:
             port = auto_detect_port()
-
         self.enabled = port is not None and serial is not None
         self.min_interval_s = min_interval_s
         self._last_sent = 0.0
         self._last_state = None
         self.conn = None
-
         if self.enabled:
             try:
                 self.conn = serial.Serial(port, baud, timeout=1)
                 time.sleep(2)
                 print(f"[serial] Connected on {port} @ {baud} baud")
             except Exception as e:
-                print(f"[serial] Failed to open {port}: {e}. Running without hardware output.")
+                print(f"[serial] Failed to open {port}: {e}")
                 self.enabled = False
 
     def send_state(self, state: str):
@@ -461,7 +398,6 @@ class SerialLink:
             return
         self._last_sent = now
         self._last_state = state
-
         if self.enabled and self.conn is not None:
             try:
                 self.conn.write(f"{state}\n".encode("utf-8"))
@@ -505,13 +441,9 @@ class PostureMonitor:
         self._last_side_points = None
         self._last_reading = PostureReading(metrics=None)
         self._last_side_angles: Tuple[Optional[float], Optional[float]] = (None, None)
-        self._history = deque(maxlen=100)
-        self.target_track_id: Optional[int] = None  # Track ID locked to the student user
+        self.target_track_id: Optional[int] = None
 
-    # ---------------------------------------------------------------- #
     def _extract_candidates(self, frame):
-        """Run YOLO tracking and extract candidates strictly for the locked target student."""
-        # Run YOLO with persistent multi-object tracking enabled
         results = self.model.track(
             frame,
             persist=True,
@@ -522,20 +454,17 @@ class PostureMonitor:
         if results.keypoints is None or len(results.keypoints.xy) == 0:
             return {}
 
-        # 1. Retrieve persistent tracking IDs from detection boxes (if present)
         track_ids = None
         if results.boxes is not None and results.boxes.id is not None:
             track_ids = results.boxes.id.int().cpu().numpy()
 
         target_idx = None
 
-        # 2. Match active target ID if already locked
         if self.target_track_id is not None and track_ids is not None:
             matches = np.where(track_ids == self.target_track_id)[0]
             if len(matches) > 0:
                 target_idx = matches[0]
 
-        # 3. Fallback: Find the person closest to the image center if no locked target matches
         if target_idx is None:
             frame_h, frame_w = frame.shape[:2]
             frame_center = np.array([frame_w / 2.0, frame_h / 2.0])
@@ -546,34 +475,25 @@ class PostureMonitor:
                 visible = kpts_np[kpts_np.any(axis=1)]
                 if len(visible) == 0:
                     continue
-
-                # Center point calculated from visible keypoints
                 center = visible.mean(axis=0)
                 dist = np.linalg.norm(center - frame_center)
                 if dist < min_dist:
                     min_dist = dist
                     target_idx = i
 
-            # Auto-assign target track ID from nearest person
             if target_idx is not None and track_ids is not None:
                 self.target_track_id = int(track_ids[target_idx])
 
         if target_idx is None:
             return {}
 
-        # 4. Extract keypoints exclusively for the target student
         keypoints = results.keypoints.xy[target_idx].cpu().numpy()
         confs = results.keypoints.conf[target_idx].cpu().numpy()
         candidates = {}
 
         front = extract_front_posture_metrics(keypoints, confs, self.cfg)
         if front is not None:
-            required = (
-                self.cfg.KP_L_EYE,
-                self.cfg.KP_R_EYE,
-                self.cfg.KP_L_SHOULDER,
-                self.cfg.KP_R_SHOULDER,
-            )
+            required = (self.cfg.KP_L_EYE, self.cfg.KP_R_EYE, self.cfg.KP_L_SHOULDER, self.cfg.KP_R_SHOULDER)
             quality = float(np.mean(confs[list(required)]))
             candidates["FRONT"] = (quality, front)
 
@@ -584,53 +504,46 @@ class PostureMonitor:
 
         return candidates
 
-    # ---------------------------------------------------------------- #
     def _select_mode(self, candidates) -> Optional[str]:
         if not candidates:
             self._candidate_mode = None
             self._candidate_count = 0
             return self._active_mode
 
-        best_mode = max(candidates, key=lambda mode: candidates[mode][0])
+        weighted_candidates = {}
+        for mode, (qual, data) in candidates.items():
+            score = qual
+            if mode == self._active_mode:
+                score += self.cfg.side_mode_bias if mode == "SIDE" else (self.cfg.switch_margin / 2)
+            weighted_candidates[mode] = score
+
+        best_mode = max(weighted_candidates, key=lambda m: weighted_candidates[m])
+
         if self._active_mode is None:
             self._active_mode = best_mode
             self._candidate_mode = None
             self._candidate_count = 0
-            print(f"[view] Switched to {self._active_mode} tracking.")
-            return self._active_mode
-
-        if self._active_mode not in candidates:
-            self._active_mode = best_mode
-            self._candidate_mode = None
-            self._candidate_count = 0
-            print(f"[view] Switched to {self._active_mode} tracking.")
             return self._active_mode
 
         if best_mode == self._active_mode:
-            preferred_mode = self._active_mode
-        else:
-            current_quality = candidates[self._active_mode][0]
-            preferred_mode = best_mode if candidates[best_mode][0] >= current_quality + self.cfg.switch_margin else self._active_mode
-
-        if preferred_mode == self._active_mode:
             self._candidate_mode = None
             self._candidate_count = 0
             return self._active_mode
 
-        if preferred_mode == self._candidate_mode:
+        if best_mode == self._candidate_mode:
             self._candidate_count += 1
         else:
-            self._candidate_mode = preferred_mode
+            self._candidate_mode = best_mode
             self._candidate_count = 1
 
         if self._candidate_count >= self.cfg.switch_confirm_samples:
-            self._active_mode = preferred_mode
+            self._active_mode = best_mode
             self._candidate_mode = None
             self._candidate_count = 0
-            print(f"[view] Switched to {self._active_mode} tracking.")
+            print(f"[view] Confirmed view switch to {self._active_mode} tracking.")
+
         return self._active_mode
 
-    # ---------------------------------------------------------------- #
     def _calibrate_front(self, metrics: FrontPostureMetrics):
         self.front_baseline.set(metrics)
         self.front_metric_smoother.reset()
@@ -642,7 +555,6 @@ class PostureMonitor:
         self.side_trunk_smoother.reset()
         print(f"[calibration] Side baseline set -> neck: {neck_angle:.1f} deg, trunk: {trunk_angle:.1f} deg")
 
-    # ---------------------------------------------------------------- #
     def _update_front(self, extracted):
         metrics, tracking_points = extracted
         self._last_tracking_points = tracking_points
@@ -677,18 +589,15 @@ class PostureMonitor:
         else:
             self._last_state = "NEUTRAL"
 
-    # ---------------------------------------------------------------- #
     def _draw_front_tracking(self, frame):
         points = self._last_tracking_points
         if points is None:
             return frame
-
-        left_eye = tuple(points["left_eye"].astype(int))
-        right_eye = tuple(points["right_eye"].astype(int))
+        left_eye, right_eye = tuple(points["left_eye"].astype(int)), tuple(points["right_eye"].astype(int))
         eye_center = tuple(points["eye_center"].astype(int))
-        left_shoulder = tuple(points["left_shoulder"].astype(int))
-        right_shoulder = tuple(points["right_shoulder"].astype(int))
+        left_shoulder, right_shoulder = tuple(points["left_shoulder"].astype(int)), tuple(points["right_shoulder"].astype(int))
         shoulder_center = tuple(points["shoulder_center"].astype(int))
+
         cv2.line(frame, left_eye, right_eye, (0, 255, 255), 3)
         cv2.line(frame, left_shoulder, right_shoulder, (255, 180, 0), 3)
         cv2.line(frame, shoulder_center, eye_center, (255, 180, 0), 3)
@@ -710,7 +619,6 @@ class PostureMonitor:
         cv2.putText(frame, f"Tracked side: {side_name}", (10, frame.shape[0] - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230, 230, 230), 2)
         return frame
 
-    # ---------------------------------------------------------------- #
     def _draw_overlay(self, frame, reading: PostureReading, state: str):
         if self._active_mode == "FRONT":
             frame = self._draw_front_tracking(frame)
@@ -720,7 +628,7 @@ class PostureMonitor:
         metrics = reading.metrics
         if self._active_mode == "FRONT":
             lines = [
-                "Mode: FRONT",
+                f"Mode: FRONT (Target #{self.target_track_id})",
                 f"State: {state}",
                 f"Posture score: {reading.score:.0f}/100" if reading.score is not None else "Posture score: --",
                 f"Eye drop: {metrics.eye_drop:.2f}" if metrics is not None else "Eye drop: --",
@@ -734,14 +642,14 @@ class PostureMonitor:
         elif self._active_mode == "SIDE":
             neck_angle, trunk_angle = self._last_side_angles
             lines = [
-                "Mode: SIDE",
+                f"Mode: SIDE (Target #{self.target_track_id})",
                 f"State: {state}",
                 f"Neck angle: {neck_angle:.1f} deg" if neck_angle is not None else "Neck angle: --",
                 f"Trunk angle: {trunk_angle:.1f} deg" if trunk_angle is not None else "Trunk angle: --",
                 "Side baseline: SET" if self.side_baseline.calibrated else "Side baseline: NOT SET (press 'c')",
             ]
         else:
-            lines = ["Mode: FINDING VIEW", "Show either your face and both shoulders, or one full side of your upper body."]
+            lines = ["Mode: FINDING VIEW", "Show face & shoulders, or side profile."]
         color = {"HAPPY": (0, 200, 0), "NEUTRAL": (0, 200, 200), "SAD": (0, 0, 220)}.get(state, (255, 255, 255))
         y = 30
         for line in lines:
@@ -749,15 +657,13 @@ class PostureMonitor:
             y += 25
         return frame
 
-    # ---------------------------------------------------------------- #
     def run(self):
-        print("Automatic front/side posture mode.")
-        print("Show a view for a few seconds, press 'c' to calibrate that view, 'q' to quit.")
+        print("Automatic front/side posture mode with student targeting.")
+        print("Press 'c' to calibrate & lock active target, 'q' to quit.")
         try:
             while True:
                 ok, frame = self.cap.read()
                 if not ok:
-                    print("[capture] Frame grab failed, retrying...")
                     time.sleep(0.5)
                     continue
 
@@ -782,7 +688,6 @@ class PostureMonitor:
                 if key == ord("q"):
                     break
                 if key == ord("c"):
-                    # Clear current lock so it selects the person closest to frame center
                     self.target_track_id = None
                     candidates = self._extract_candidates(frame)
                     active_mode = self._select_mode(candidates)
@@ -791,12 +696,12 @@ class PostureMonitor:
                         _, extracted = candidates[active_mode]
                         metrics, _ = extracted
                         self._calibrate_front(metrics)
-                        print(f"[tracking] Locked to student target ID #{self.target_track_id}")
+                        print(f"[tracking] Locked onto target student #{self.target_track_id}")
                     elif active_mode == "SIDE" and active_mode in candidates:
                         _, extracted = candidates[active_mode]
                         ear, shoulder, hip, _ = extracted
                         self._calibrate_side(angle_from_vertical(ear, shoulder), angle_from_vertical(shoulder, hip))
-                        print(f"[tracking] Locked to student target ID #{self.target_track_id}")
+                        print(f"[tracking] Locked onto target student #{self.target_track_id}")
                     else:
                         print("[calibration] Wait for FRONT or SIDE mode before calibrating.")
 
@@ -806,20 +711,13 @@ class PostureMonitor:
             self.serial_link.close()
 
 
-# --------------------------------------------------------------------------- #
-# Entry point
-# --------------------------------------------------------------------------- #
-
 def parse_args() -> Config:
     p = argparse.ArgumentParser(description="Automatic front/side posture monitor backend for Stats & Emotion Cube")
     p.add_argument("--model", default="yolov8n-pose.pt")
     p.add_argument("--camera", type=int, default=0)
-    p.add_argument("--interval", type=float, default=0.5, help="Seconds between inference samples")
-    p.add_argument("--imgsz", type=int, default=320, help="YOLO inference image size; lower is faster")
-    p.add_argument("--front-min-eye-ratio", type=float, default=0.12, help="Minimum eye-width/shoulder-width ratio required for front tracking")
-    p.add_argument("--switch-samples", type=int, default=3, help="Consecutive samples required before changing views")
-    p.add_argument("--switch-margin", type=float, default=0.08, help="Confidence lead required before changing views")
-    p.add_argument("--port", type=str, default=None, help="Serial port, e.g. COM5 or /dev/ttyUSB0")
+    p.add_argument("--interval", type=float, default=0.5)
+    p.add_argument("--imgsz", type=int, default=320)
+    p.add_argument("--port", type=str, default=None)
     p.add_argument("--baud", type=int, default=115200)
     args = p.parse_args()
 
@@ -828,9 +726,6 @@ def parse_args() -> Config:
         camera_index=args.camera,
         sample_interval_s=args.interval,
         model_imgsz=args.imgsz,
-        front_min_eye_shoulder_ratio=args.front_min_eye_ratio,
-        switch_confirm_samples=args.switch_samples,
-        switch_margin=args.switch_margin,
         serial_port=args.port,
         serial_baud=args.baud,
     )
