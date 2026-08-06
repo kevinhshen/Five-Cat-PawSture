@@ -48,7 +48,7 @@ class Config:
     # -- Front-view geometry checks --
     # In side/angled views, shoulder width collapses relative to the eyes or vice-versa.
     front_min_eye_shoulder_ratio: float = 0.16
-    front_max_eye_tilt_ratio: float = 0.25
+    front_max_eye_tilt_ratio: float = 0.8
     front_min_shoulder_head_ratio: float = 2.2  # Shoulders must be at least 2.2x eye width for a valid front view
 
     # -- Classification thresholds for front-view posture score (0-100) --
