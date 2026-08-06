@@ -21,7 +21,6 @@ Controls:
 Dependencies:
     pip install ultralytics opencv-python pyserial numpy
 """
-
 import argparse
 import time
 from collections import deque
@@ -49,12 +48,17 @@ class Config:
     # -- Model / capture --
     model_path: str = "yolov8n-pose.pt"
     camera_index: int = 0
-    sample_interval_s: float = 1.0
+    sample_interval_s: float = 0.5
     model_imgsz: int = 320
     conf_threshold: float = 0.45
 
     # -- Smoothing --
     ema_alpha: float = 0.3
+
+    # -- Front-view geometry checks --
+    # In side view, YOLO may place both eye keypoints on the same visible eye.
+    # A real front view should have a meaningful eye span compared with shoulders.
+    front_min_eye_shoulder_ratio: float = 0.12
 
     # -- Classification thresholds for a combined 0-100 front-view posture score --
     neutral_score: float = 28.0
@@ -214,6 +218,8 @@ def extract_front_posture_metrics(
     eye_center = midpoint(left_eye, right_eye)
     eye_width_px = float(np.linalg.norm(left_eye - right_eye))
     if eye_width_px < 8:
+        return None
+    if (eye_width_px / shoulder_width_px) < cfg.front_min_eye_shoulder_ratio:
         return None
 
     hip_center = None
@@ -484,7 +490,6 @@ class PostureMonitor:
             raise RuntimeError(f"Could not open camera index {cfg.camera_index}")
 
         self.front_metric_smoother = MetricSmoother(cfg.ema_alpha)
-        self.front_score_smoother = EMASmoother(cfg.ema_alpha)
         self.front_baseline = Baseline()
         self.side_neck_smoother = EMASmoother(cfg.ema_alpha)
         self.side_trunk_smoother = EMASmoother(cfg.ema_alpha)
@@ -534,9 +539,21 @@ class PostureMonitor:
             return self._active_mode
 
         best_mode = max(candidates, key=lambda mode: candidates[mode][0])
-        if self._active_mode is None or self._active_mode not in candidates:
-            preferred_mode = best_mode
-        elif best_mode == self._active_mode:
+        if self._active_mode is None:
+            self._active_mode = best_mode
+            self._candidate_mode = None
+            self._candidate_count = 0
+            print(f"[view] Switched to {self._active_mode} tracking.")
+            return self._active_mode
+
+        if self._active_mode not in candidates:
+            self._active_mode = best_mode
+            self._candidate_mode = None
+            self._candidate_count = 0
+            print(f"[view] Switched to {self._active_mode} tracking.")
+            return self._active_mode
+
+        if best_mode == self._active_mode:
             preferred_mode = self._active_mode
         else:
             current_quality = candidates[self._active_mode][0]
@@ -564,7 +581,6 @@ class PostureMonitor:
     def _calibrate_front(self, metrics: FrontPostureMetrics):
         self.front_baseline.set(metrics)
         self.front_metric_smoother.reset()
-        self.front_score_smoother.reset()
         print(f"[calibration] Front baseline set -> eye width: {metrics.eye_width_px:.1f}px")
 
     def _calibrate_side(self, neck_angle: float, trunk_angle: float):
@@ -582,8 +598,7 @@ class PostureMonitor:
         score = None
         compression = None
         if self.front_baseline.calibrated and self.front_baseline.metrics is not None:
-            raw_score, compression = score_front_posture(smoothed_metrics, self.front_baseline.metrics)
-            score = self.front_score_smoother.update(raw_score)
+            score, compression = score_front_posture(metrics, self.front_baseline.metrics)
             self._last_state = classify_state(score, self.cfg)
             self.serial_link.send_state(self._last_state)
         else:
@@ -741,8 +756,9 @@ def parse_args() -> Config:
     p = argparse.ArgumentParser(description="Automatic front/side posture monitor backend for Stats & Emotion Cube")
     p.add_argument("--model", default="yolov8n-pose.pt")
     p.add_argument("--camera", type=int, default=0)
-    p.add_argument("--interval", type=float, default=1.0, help="Seconds between inference samples")
+    p.add_argument("--interval", type=float, default=0.5, help="Seconds between inference samples")
     p.add_argument("--imgsz", type=int, default=320, help="YOLO inference image size; lower is faster")
+    p.add_argument("--front-min-eye-ratio", type=float, default=0.12, help="Minimum eye-width/shoulder-width ratio required for front tracking")
     p.add_argument("--switch-samples", type=int, default=3, help="Consecutive samples required before changing views")
     p.add_argument("--switch-margin", type=float, default=0.08, help="Confidence lead required before changing views")
     p.add_argument("--port", type=str, default=None, help="Serial port, e.g. COM5 or /dev/ttyUSB0")
@@ -754,6 +770,7 @@ def parse_args() -> Config:
         camera_index=args.camera,
         sample_interval_s=args.interval,
         model_imgsz=args.imgsz,
+        front_min_eye_shoulder_ratio=args.front_min_eye_ratio,
         switch_confirm_samples=args.switch_samples,
         switch_margin=args.switch_margin,
         serial_port=args.port,
