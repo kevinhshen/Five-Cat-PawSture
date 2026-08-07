@@ -567,15 +567,27 @@ class PostureMonitor:
         self._last_switch_t = 0.0
         self._running = True
         self._latest_jpeg: Optional[bytes] = None
+        self._last_error: Optional[str] = None
         self._state_lock = threading.Lock()
 
+    def _run_pose_inference(self, frame):
+        try:
+            return self.model.track(
+                frame,
+                persist=True,
+                verbose=False,
+                imgsz=self.cfg.model_imgsz
+            )[0]
+        except Exception as exc:
+            print(f"[model] Tracking failed, falling back to single-frame detection: {exc}")
+            return self.model.predict(
+                frame,
+                verbose=False,
+                imgsz=self.cfg.model_imgsz
+            )[0]
+
     def _extract_candidates(self, frame):
-        results = self.model.track(
-            frame,
-            persist=True,
-            verbose=False,
-            imgsz=self.cfg.model_imgsz
-        )[0]
+        results = self._run_pose_inference(frame)
 
         if results.keypoints is None or len(results.keypoints.xy) == 0:
             return {}
@@ -812,7 +824,7 @@ class PostureMonitor:
         metrics = reading.metrics
         if self._active_mode == "FRONT":
             lines = [
-                f"Mode: FRONT (Target #{self.target_track_id})",
+                "Mode: FRONT",
                 f"State: {state}",
                 f"Posture score: {reading.score:.0f}/100" if reading.score is not None else "Posture score: --",
                 f"Eye drop: {metrics.eye_drop:.2f}" if metrics is not None else "Eye drop: --",
@@ -831,7 +843,7 @@ class PostureMonitor:
         elif self._active_mode == "SIDE":
             neck_angle, trunk_angle = self._last_side_angles
             lines = [
-                f"Mode: SIDE (Target #{self.target_track_id})",
+                "Mode: SIDE",
                 f"State: {state}",
                 f"Neck angle: {neck_angle:.1f} deg" if neck_angle is not None else "Neck angle: --",
                 f"Trunk angle: {trunk_angle:.1f} deg" if trunk_angle is not None else "Trunk angle: --",
@@ -856,14 +868,19 @@ class PostureMonitor:
 
         if do_inference:
             self._last_sample_t = now
-            candidates = self._extract_candidates(frame)
-            active_mode = self._select_mode(candidates)
-            if active_mode is not None and active_mode in candidates:
-                _, extracted = candidates[active_mode]
-                if active_mode == "FRONT":
-                    self._update_front(extracted)
-                else:
-                    self._update_side(extracted)
+            try:
+                candidates = self._extract_candidates(frame)
+                active_mode = self._select_mode(candidates)
+                if active_mode is not None and active_mode in candidates:
+                    _, extracted = candidates[active_mode]
+                    if active_mode == "FRONT":
+                        self._update_front(extracted)
+                    else:
+                        self._update_side(extracted)
+                self._last_error = None
+            except Exception as exc:
+                self._last_error = str(exc)
+                print(f"[frame] Processing failed: {exc}")
 
         if self._last_state == "SAD":
             if self._bad_state_start_t is None:
@@ -910,12 +927,12 @@ class PostureMonitor:
             active_mode = self._active_mode
             if active_mode == "FRONT" and self._last_reading.metrics is not None:
                 self._calibrate_front(self._last_reading.metrics)
-                return True, f"Front baseline set for target #{self.target_track_id}"
+                return True, "Front baseline set."
             if active_mode == "SIDE":
                 neck_angle, trunk_angle = self._last_side_angles
                 if neck_angle is not None and trunk_angle is not None:
                     self._calibrate_side(neck_angle, trunk_angle)
-                    return True, f"Side baseline set for target #{self.target_track_id}"
+                    return True, "Side baseline set."
             return False, "Wait for front or side tracking before calibrating."
 
     def toggle_audio(self) -> Dict[str, object]:
@@ -924,25 +941,17 @@ class PostureMonitor:
             print(f"[audio] Alerts {'enabled' if self.audio_on else 'muted'}")
             return self.status_payload()
 
-    def reset_target(self) -> Dict[str, object]:
-        with self._state_lock:
-            self.target_track_id = None
-            self.front_baseline.clear()
-            self.side_baseline.clear()
-            self._front_calibration_samples.clear()
-            self._side_calibration_samples.clear()
-            self.front_metric_smoother.reset()
-            self.side_neck_smoother.reset()
-            self.side_trunk_smoother.reset()
-            print("[tracking] Target and baselines reset; the centered student will be selected next.")
-            return self.status_payload()
-
     def stop(self) -> Dict[str, object]:
         with self._state_lock:
             self._running = False
             return self.status_payload()
 
     def status_payload(self) -> Dict[str, object]:
+        def safe_round(value: Optional[float]) -> Optional[float]:
+            if value is None or not np.isfinite(value):
+                return None
+            return round(float(value), 1)
+
         mode = self._active_mode or "FINDING"
         score = self._last_reading.score
         compression = self._last_reading.compression_pct
@@ -950,17 +959,17 @@ class PostureMonitor:
         return {
             "state": self._last_state,
             "mode": mode,
-            "target": self.target_track_id,
             "audioOn": self.audio_on,
             "autoCalibrate": self.cfg.auto_calibrate,
             "frontBaseline": self.front_baseline.calibrated,
             "sideBaseline": self.side_baseline.calibrated,
             "serialConnected": bool(self.serial_link.enabled and self.serial_link.conn is not None),
-            "score": round(score, 1) if score is not None else None,
-            "compression": round(compression, 1) if compression is not None else None,
-            "neckAngle": round(neck_angle, 1) if neck_angle is not None else None,
-            "trunkAngle": round(trunk_angle, 1) if trunk_angle is not None else None,
+            "score": safe_round(score),
+            "compression": safe_round(compression),
+            "neckAngle": safe_round(neck_angle),
+            "trunkAngle": safe_round(trunk_angle),
             "running": self._running,
+            "error": self._last_error,
         }
 
     def latest_jpeg(self) -> Optional[bytes]:
@@ -980,6 +989,7 @@ class PostureMonitor:
             while self._running:
                 ok, frame = self.cap.read()
                 if not ok:
+                    self._last_error = "Camera frame not available."
                     time.sleep(0.5)
                     continue
                 self._process_frame(frame, show_keyboard_hints=False)
@@ -992,12 +1002,13 @@ class PostureMonitor:
             self.serial_link.close()
 
     def run(self):
-        print("Automatic front/side posture mode with student targeting.")
+        print("Automatic front/side posture mode.")
         print("Baselines auto-capture for each view; press 'c' to recalibrate active view, 'm' to mute, 'q' to quit.")
         try:
             while True:
                 ok, frame = self.cap.read()
                 if not ok:
+                    self._last_error = "Camera frame not available."
                     time.sleep(0.5)
                     continue
 
@@ -1311,7 +1322,6 @@ WEB_HTML = """<!doctype html>
 
         <section class="panel stats">
           <div class="row"><span>Mode</span><strong id="modeValue">Finding</strong></div>
-          <div class="row"><span>Target</span><strong id="targetValue">--</strong></div>
           <div class="row"><span>Score</span><strong id="scoreValue">--</strong></div>
           <div class="row"><span>Neck angle</span><strong id="neckValue">--</strong></div>
           <div class="row"><span>Trunk angle</span><strong id="trunkValue">--</strong></div>
@@ -1322,7 +1332,6 @@ WEB_HTML = """<!doctype html>
         <section class="panel controls">
           <button id="calibrateBtn">Recalibrate [C]</button>
           <button id="audioBtn" class="secondary">Mute Alerts [M]</button>
-          <button id="resetBtn" class="secondary">Reset Target [R]</button>
           <button id="stopBtn" class="danger">Stop Session [Q]</button>
           <div id="message" class="message"></div>
         </section>
@@ -1352,7 +1361,6 @@ WEB_HTML = """<!doctype html>
       stateValue.classList.toggle("sad", data.state === "SAD");
 
       $("modeValue").textContent = titleCase(data.mode);
-      $("targetValue").textContent = data.target === null || data.target === undefined ? "--" : `#${data.target}`;
       $("scoreValue").textContent = formatNumber(data.score, "/100");
       $("neckValue").textContent = formatNumber(data.neckAngle, " deg");
       $("trunkValue").textContent = formatNumber(data.trunkAngle, " deg");
@@ -1364,7 +1372,7 @@ WEB_HTML = """<!doctype html>
       $("deviceDot").classList.toggle("connected", data.serialConnected);
       $("deviceText").textContent = data.serialConnected ? "Device connected" : "Device disconnected";
       $("footerStatus").textContent = data.running
-        ? `Tracking ${titleCase(data.mode)} view`
+        ? (data.error ? `Tracking issue: ${data.error}` : `Tracking ${titleCase(data.mode)} view`)
         : "Session stopped";
     }
 
@@ -1391,7 +1399,6 @@ WEB_HTML = """<!doctype html>
 
     $("calibrateBtn").addEventListener("click", () => postAction("/calibrate", "Calibrating..."));
     $("audioBtn").addEventListener("click", () => postAction("/toggle-audio", "Updating audio..."));
-    $("resetBtn").addEventListener("click", () => postAction("/reset-target", "Resetting target..."));
     $("stopBtn").addEventListener("click", () => postAction("/stop", "Stopping session..."));
 
     document.addEventListener("keydown", (event) => {
@@ -1406,9 +1413,6 @@ WEB_HTML = """<!doctype html>
       } else if (key === "m") {
         event.preventDefault();
         postAction("/toggle-audio", "Updating audio...");
-      } else if (key === "r") {
-        event.preventDefault();
-        postAction("/reset-target", "Resetting target...");
       } else if (key === "q") {
         event.preventDefault();
         postAction("/stop", "Stopping session...");
@@ -1477,9 +1481,6 @@ def make_web_server(monitor: PostureMonitor) -> ThreadingHTTPServer:
                 return
             if path == "/toggle-audio":
                 self._send_json({"ok": True, "message": "", "status": monitor.toggle_audio()})
-                return
-            if path == "/reset-target":
-                self._send_json({"ok": True, "message": "Target reset.", "status": monitor.reset_target()})
                 return
             if path == "/stop":
                 self._send_json({"ok": True, "message": "Session stopped.", "status": monitor.stop()})
