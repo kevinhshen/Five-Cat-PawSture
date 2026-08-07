@@ -6,6 +6,27 @@ Start the program with:
 python3 run.py
 ```
 
+On macOS, you can start the browser version without opening VS Code or typing a
+command by double-clicking:
+
+```text
+Start PawSture Web.command
+```
+
+That starts the local PawSture server and opens the web console automatically.
+
+To use the browser console instead of the OpenCV window:
+
+```bash
+python3 run.py --web
+```
+
+The browser should open automatically. If it does not, open:
+
+```text
+http://127.0.0.1:8000
+```
+
 The launcher checks for the required packages and offers to install anything
 missing automatically. It also uses the local `.venv` environment automatically,
 so you do not need to activate it first.
@@ -26,4 +47,10 @@ You can still pass monitor options after the launcher option, for example:
 
 ```bash
 python3 run.py --camera 1 --port /dev/cu.usbmodem1101
+```
+
+The web console supports the same monitor options:
+
+```bash
+python3 run.py --web --camera 1 --port /dev/cu.usbmodem1101
 ```

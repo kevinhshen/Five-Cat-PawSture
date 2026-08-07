@@ -12,13 +12,18 @@ Dependencies:
     pip install ultralytics opencv-python pyserial numpy
 """
 import argparse
+import json
 import time
 import threading
 import platform
 import subprocess
+import webbrowser
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from collections import deque
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
+from urllib.parse import urlparse
 
 import cv2
 import numpy as np
@@ -77,6 +82,12 @@ class Config:
     serial_port: Optional[str] = None
     serial_baud: int = 115200
     send_min_interval_s: float = 1.0
+
+    # -- Web console --
+    web_enabled: bool = False
+    web_host: str = "127.0.0.1"
+    web_port: int = 8000
+    web_open_browser: bool = True
 
     # -- YOLOv8-Pose COCO keypoint indices --
     KP_NOSE: int = 0
@@ -525,6 +536,9 @@ class PostureMonitor:
         self._bad_state_start_t = None
         self._last_alert_t = 0.0
         self._last_switch_t = 0.0
+        self._running = True
+        self._latest_jpeg: Optional[bytes] = None
+        self._state_lock = threading.Lock()
 
     def _extract_candidates(self, frame):
         results = self.model.track(
@@ -736,7 +750,7 @@ class PostureMonitor:
         draw_text_label(frame, f"Tracked side: {side_name}", (10, frame.shape[0] - 18), (230, 230, 230))
         return frame
 
-    def _draw_overlay(self, frame, reading: PostureReading, state: str):
+    def _draw_overlay(self, frame, reading: PostureReading, state: str, show_keyboard_hints: bool = True):
         if self._active_mode == "FRONT":
             frame = self._draw_front_tracking(frame)
         elif self._active_mode == "SIDE":
@@ -755,7 +769,9 @@ class PostureMonitor:
                 f"Face distance: {metrics.eye_width_px:.0f}px" if metrics is not None else "Face distance: --",
                 f"Shoulder slope: {metrics.shoulder_slope:.2f}" if metrics is not None else "Shoulder slope: --",
                 f"Neck compression: {reading.compression_pct:.0f}%" if reading.compression_pct is not None else "Neck compression: --",
-                "Front baseline: SET" if self.front_baseline.calibrated else "Front baseline: NOT SET (press 'c')",
+                "Front baseline: SET" if self.front_baseline.calibrated else (
+                    "Front baseline: NOT SET (press 'c')" if show_keyboard_hints else "Front baseline: NOT SET"
+                ),
             ]
         elif self._active_mode == "SIDE":
             neck_angle, trunk_angle = self._last_side_angles
@@ -764,7 +780,9 @@ class PostureMonitor:
                 f"State: {state}",
                 f"Neck angle: {neck_angle:.1f} deg" if neck_angle is not None else "Neck angle: --",
                 f"Trunk angle: {trunk_angle:.1f} deg" if trunk_angle is not None else "Trunk angle: --",
-                "Side baseline: SET" if self.side_baseline.calibrated else "Side baseline: NOT SET (press 'c')",
+                "Side baseline: SET" if self.side_baseline.calibrated else (
+                    "Side baseline: NOT SET (press 'c')" if show_keyboard_hints else "Side baseline: NOT SET"
+                ),
             ]
         else:
             lines = ["Mode: FINDING VIEW", "Show face & shoulders, or side profile."]
@@ -774,6 +792,142 @@ class PostureMonitor:
             cv2.putText(frame, line, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
             y += 25
         return frame
+
+    def _process_frame(self, frame, show_keyboard_hints: bool = True):
+        now = time.time()
+        do_inference = (now - self._last_sample_t) >= self.cfg.sample_interval_s
+
+        if do_inference:
+            self._last_sample_t = now
+            candidates = self._extract_candidates(frame)
+            active_mode = self._select_mode(candidates)
+            if active_mode is not None and active_mode in candidates:
+                _, extracted = candidates[active_mode]
+                if active_mode == "FRONT":
+                    self._update_front(extracted)
+                else:
+                    self._update_side(extracted)
+
+        if self._last_state == "SAD":
+            if self._bad_state_start_t is None:
+                self._bad_state_start_t = now
+
+            time_in_bad = now - self._bad_state_start_t
+            time_since_switch = now - self._last_switch_t
+            time_since_alert = now - self._last_alert_t
+
+            if (self.audio_on and
+                time_in_bad >= self.cfg.bad_posture_trigger_s and
+                time_since_switch >= self.cfg.mode_switch_grace_s and
+                time_since_alert >= self.cfg.alert_cooldown_s):
+
+                threading.Thread(
+                    target=play_alert_sound,
+                    args=(self.cfg.alert_sound_path,),
+                    daemon=True
+                ).start()
+                print("[audio] Alert played!")
+
+                self._last_alert_t = now
+        else:
+            self._bad_state_start_t = None
+
+        frame = self._draw_overlay(frame, self._last_reading, self._last_state, show_keyboard_hints)
+
+        audio_status = "ON" if self.audio_on else "MUTED"
+        audio_hint = f"Audio: {audio_status}"
+        if show_keyboard_hints:
+            audio_hint += " (press 'm')"
+        cv2.putText(frame, audio_hint, (10, frame.shape[0] - 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+
+        ok, encoded = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+        if ok:
+            with self._state_lock:
+                self._latest_jpeg = encoded.tobytes()
+
+        return frame
+
+    def calibrate_current(self) -> Tuple[bool, str]:
+        with self._state_lock:
+            active_mode = self._active_mode
+            if active_mode == "FRONT" and self._last_reading.metrics is not None:
+                self._calibrate_front(self._last_reading.metrics)
+                return True, f"Front baseline set for target #{self.target_track_id}"
+            if active_mode == "SIDE":
+                neck_angle, trunk_angle = self._last_side_angles
+                if neck_angle is not None and trunk_angle is not None:
+                    self._calibrate_side(neck_angle, trunk_angle)
+                    return True, f"Side baseline set for target #{self.target_track_id}"
+            return False, "Wait for front or side tracking before calibrating."
+
+    def toggle_audio(self) -> Dict[str, object]:
+        with self._state_lock:
+            self.audio_on = not self.audio_on
+            print(f"[audio] Alerts {'enabled' if self.audio_on else 'muted'}")
+            return self.status_payload()
+
+    def reset_target(self) -> Dict[str, object]:
+        with self._state_lock:
+            self.target_track_id = None
+            self.front_metric_smoother.reset()
+            self.side_neck_smoother.reset()
+            self.side_trunk_smoother.reset()
+            print("[tracking] Target reset; the centered student will be selected next.")
+            return self.status_payload()
+
+    def stop(self) -> Dict[str, object]:
+        with self._state_lock:
+            self._running = False
+            return self.status_payload()
+
+    def status_payload(self) -> Dict[str, object]:
+        mode = self._active_mode or "FINDING"
+        score = self._last_reading.score
+        compression = self._last_reading.compression_pct
+        neck_angle, trunk_angle = self._last_side_angles
+        return {
+            "state": self._last_state,
+            "mode": mode,
+            "target": self.target_track_id,
+            "audioOn": self.audio_on,
+            "frontBaseline": self.front_baseline.calibrated,
+            "sideBaseline": self.side_baseline.calibrated,
+            "serialConnected": bool(self.serial_link.enabled and self.serial_link.conn is not None),
+            "score": round(score, 1) if score is not None else None,
+            "compression": round(compression, 1) if compression is not None else None,
+            "neckAngle": round(neck_angle, 1) if neck_angle is not None else None,
+            "trunkAngle": round(trunk_angle, 1) if trunk_angle is not None else None,
+            "running": self._running,
+        }
+
+    def latest_jpeg(self) -> Optional[bytes]:
+        with self._state_lock:
+            return self._latest_jpeg
+
+    def run_web(self):
+        server = make_web_server(self)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        url = f"http://{self.cfg.web_host}:{self.cfg.web_port}"
+        print("PawSture web console is running.")
+        print(f"Open {url}")
+        if self.cfg.web_open_browser:
+            threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+        try:
+            while self._running:
+                ok, frame = self.cap.read()
+                if not ok:
+                    time.sleep(0.5)
+                    continue
+                self._process_frame(frame, show_keyboard_hints=False)
+                time.sleep(0.01)
+        finally:
+            self._running = False
+            server.shutdown()
+            server.server_close()
+            self.cap.release()
+            self.serial_link.close()
 
     def run(self):
         print("Automatic front/side posture mode with student targeting.")
@@ -785,81 +939,492 @@ class PostureMonitor:
                     time.sleep(0.5)
                     continue
 
-                now = time.time()
-                do_inference = (now - self._last_sample_t) >= self.cfg.sample_interval_s
-
-                if do_inference:
-                    self._last_sample_t = now
-                    candidates = self._extract_candidates(frame)
-                    active_mode = self._select_mode(candidates)
-                    if active_mode is not None and active_mode in candidates:
-                        _, extracted = candidates[active_mode]
-                        if active_mode == "FRONT":
-                            self._update_front(extracted)
-                        else:
-                            self._update_side(extracted)
-
-                if self._last_state == "SAD":
-                    if self._bad_state_start_t is None:
-                        self._bad_state_start_t = now 
-
-                    time_in_bad = now - self._bad_state_start_t
-                    time_since_switch = now - self._last_switch_t
-                    time_since_alert = now - self._last_alert_t
-
-                    if (self.audio_on and 
-                        time_in_bad >= self.cfg.bad_posture_trigger_s and
-                        time_since_switch >= self.cfg.mode_switch_grace_s and
-                        time_since_alert >= self.cfg.alert_cooldown_s):
-                        
-                        # Trigger cross-platform sound in a background thread
-                        threading.Thread(
-                            target=play_alert_sound, 
-                            args=(self.cfg.alert_sound_path,), 
-                            daemon=True
-                        ).start()
-                        print("[audio] Alert played!")
-                        
-                        self._last_alert_t = now
-                else:
-                    self._bad_state_start_t = None
-
-                frame = self._draw_overlay(frame, self._last_reading, self._last_state)
-                
-                audio_status = "ON" if self.audio_on else "MUTED"
-                cv2.putText(frame, f"Audio: {audio_status} (press 'm')", (10, frame.shape[0] - 40), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
-
+                frame = self._process_frame(frame)
                 cv2.imshow("Posture Monitor - Auto Front/Side", frame)
 
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q"):
                     break
                 if key == ord("c"):
-                    self.target_track_id = None
-                    candidates = self._extract_candidates(frame)
-                    active_mode = self._select_mode(candidates)
-
-                    if active_mode == "FRONT" and active_mode in candidates:
-                        _, extracted = candidates[active_mode]
-                        metrics, _ = extracted
-                        self._calibrate_front(metrics)
-                        print(f"[tracking] Locked onto target student #{self.target_track_id}")
-                    elif active_mode == "SIDE" and active_mode in candidates:
-                        _, extracted = candidates[active_mode]
-                        ear, shoulder, hip, _ = extracted
-                        self._calibrate_side(angle_from_vertical(ear, shoulder), angle_from_vertical(shoulder, hip))
-                        print(f"[tracking] Locked onto target student #{self.target_track_id}")
-                    else:
-                        print("[calibration] Wait for FRONT or SIDE mode before calibrating.")
+                    ok, message = self.calibrate_current()
+                    if not ok:
+                        print(f"[calibration] {message}")
                 if key == ord("m"):
-                    self.audio_on = not self.audio_on
-                    print(f"[audio] Alerts {'enabled' if self.audio_on else 'muted'}")
+                    self.toggle_audio()
 
         finally:
             self.cap.release()
             cv2.destroyAllWindows()
             self.serial_link.close()
+
+
+WEB_HTML = """<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PawSture Console</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #101216;
+      --panel: #181c22;
+      --panel-2: #202631;
+      --line: #323946;
+      --text: #f4f7fb;
+      --muted: #aab4c2;
+      --green: #49d17d;
+      --yellow: #f3c969;
+      --red: #ff6f6f;
+      --blue: #66b7ff;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .app {
+      min-height: 100vh;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+    }
+
+    header {
+      height: 64px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 20px;
+      padding: 0 22px;
+      border-bottom: 1px solid var(--line);
+      background: #151920;
+    }
+
+    .brand {
+      display: flex;
+      align-items: baseline;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 22px;
+      line-height: 1;
+      letter-spacing: 0;
+    }
+
+    .subtitle {
+      color: var(--muted);
+      font-size: 13px;
+      white-space: nowrap;
+    }
+
+    .top-status {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      color: var(--muted);
+      font-size: 14px;
+      min-width: 0;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      background: var(--red);
+      box-shadow: 0 0 16px currentColor;
+      flex: 0 0 auto;
+    }
+
+    .dot.connected {
+      background: var(--green);
+    }
+
+    main {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 320px;
+      gap: 18px;
+      padding: 18px;
+      min-height: 0;
+    }
+
+    .viewer {
+      min-height: 0;
+      border: 1px solid var(--line);
+      background: #050608;
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+      border-radius: 8px;
+    }
+
+    .viewer img {
+      width: 100%;
+      height: 100%;
+      object-fit: contain;
+      display: block;
+    }
+
+    aside {
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .panel {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 14px;
+    }
+
+    .state {
+      display: grid;
+      gap: 8px;
+      padding: 16px;
+      background: var(--panel-2);
+      border-radius: 8px;
+      border: 1px solid var(--line);
+    }
+
+    .state-label {
+      color: var(--muted);
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: .08em;
+    }
+
+    .state-value {
+      font-size: 34px;
+      line-height: 1;
+      font-weight: 800;
+      color: var(--yellow);
+    }
+
+    .state-value.happy {
+      color: var(--green);
+    }
+
+    .state-value.sad {
+      color: var(--red);
+    }
+
+    .stats {
+      display: grid;
+      gap: 10px;
+    }
+
+    .row {
+      min-height: 34px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      border-bottom: 1px solid rgba(255, 255, 255, .07);
+    }
+
+    .row:last-child {
+      border-bottom: 0;
+    }
+
+    .row span:first-child {
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .row strong {
+      font-size: 14px;
+      text-align: right;
+    }
+
+    .controls {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+    }
+
+    button {
+      height: 44px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #edf3fa;
+      color: #11151b;
+      font: inherit;
+      font-weight: 750;
+      cursor: pointer;
+    }
+
+    button.secondary {
+      background: #222a35;
+      color: var(--text);
+    }
+
+    button.danger {
+      background: #3a2024;
+      color: #ffd7d7;
+      border-color: #684049;
+    }
+
+    button:active {
+      transform: translateY(1px);
+    }
+
+    .message {
+      min-height: 20px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    footer {
+      min-height: 46px;
+      display: flex;
+      align-items: center;
+      padding: 0 22px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 13px;
+      background: #151920;
+    }
+
+    @media (max-width: 900px) {
+      header {
+        height: auto;
+        min-height: 64px;
+        align-items: flex-start;
+        flex-direction: column;
+        padding: 14px;
+        gap: 8px;
+      }
+
+      main {
+        grid-template-columns: 1fr;
+        padding: 12px;
+      }
+
+      .viewer {
+        aspect-ratio: 4 / 3;
+      }
+
+      aside {
+        min-height: auto;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <div class="brand">
+        <h1>PawSture</h1>
+        <div class="subtitle">Live posture monitor</div>
+      </div>
+      <div class="top-status">
+        <span id="deviceDot" class="dot"></span>
+        <span id="deviceText">Device disconnected</span>
+        <span id="audioText">Audio on</span>
+      </div>
+    </header>
+
+    <main>
+      <section class="viewer" aria-label="Live camera tracking view">
+        <img src="/video_feed" alt="Live camera feed with posture tracking overlay">
+      </section>
+
+      <aside>
+        <section class="state">
+          <div class="state-label">Posture State</div>
+          <div id="stateValue" class="state-value">NEUTRAL</div>
+        </section>
+
+        <section class="panel stats">
+          <div class="row"><span>Mode</span><strong id="modeValue">Finding</strong></div>
+          <div class="row"><span>Target</span><strong id="targetValue">--</strong></div>
+          <div class="row"><span>Score</span><strong id="scoreValue">--</strong></div>
+          <div class="row"><span>Neck angle</span><strong id="neckValue">--</strong></div>
+          <div class="row"><span>Trunk angle</span><strong id="trunkValue">--</strong></div>
+          <div class="row"><span>Front baseline</span><strong id="frontValue">Not set</strong></div>
+          <div class="row"><span>Side baseline</span><strong id="sideValue">Not set</strong></div>
+        </section>
+
+        <section class="panel controls">
+          <button id="calibrateBtn">Calibrate [C]</button>
+          <button id="audioBtn" class="secondary">Mute Alerts [M]</button>
+          <button id="resetBtn" class="secondary">Reset Target [R]</button>
+          <button id="stopBtn" class="danger">Stop Session [Q]</button>
+          <div id="message" class="message"></div>
+        </section>
+      </aside>
+    </main>
+
+    <footer id="footerStatus">Waiting for live tracking...</footer>
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const stateValue = $("stateValue");
+    const message = $("message");
+
+    function formatNumber(value, suffix = "") {
+      return value === null || value === undefined ? "--" : `${value}${suffix}`;
+    }
+
+    function titleCase(value) {
+      if (!value) return "--";
+      return value.charAt(0) + value.slice(1).toLowerCase();
+    }
+
+    function renderStatus(data) {
+      stateValue.textContent = data.state || "NEUTRAL";
+      stateValue.classList.toggle("happy", data.state === "HAPPY");
+      stateValue.classList.toggle("sad", data.state === "SAD");
+
+      $("modeValue").textContent = titleCase(data.mode);
+      $("targetValue").textContent = data.target === null || data.target === undefined ? "--" : `#${data.target}`;
+      $("scoreValue").textContent = formatNumber(data.score, "/100");
+      $("neckValue").textContent = formatNumber(data.neckAngle, " deg");
+      $("trunkValue").textContent = formatNumber(data.trunkAngle, " deg");
+      $("frontValue").textContent = data.frontBaseline ? "Set" : "Not set";
+      $("sideValue").textContent = data.sideBaseline ? "Set" : "Not set";
+      $("audioText").textContent = data.audioOn ? "Audio on" : "Audio muted";
+      $("audioBtn").textContent = data.audioOn ? "Mute Alerts [M]" : "Unmute Alerts [M]";
+
+      $("deviceDot").classList.toggle("connected", data.serialConnected);
+      $("deviceText").textContent = data.serialConnected ? "Device connected" : "Device disconnected";
+      $("footerStatus").textContent = data.running
+        ? `Tracking ${titleCase(data.mode)} view`
+        : "Session stopped";
+    }
+
+    async function refreshStatus() {
+      try {
+        const res = await fetch("/status", { cache: "no-store" });
+        renderStatus(await res.json());
+      } catch (error) {
+        $("footerStatus").textContent = "Connection lost";
+      }
+    }
+
+    async function postAction(path, label) {
+      message.textContent = label;
+      try {
+        const res = await fetch(path, { method: "POST" });
+        const data = await res.json();
+        renderStatus(data.status || data);
+        message.textContent = data.message || "";
+      } catch (error) {
+        message.textContent = "Command failed.";
+      }
+    }
+
+    $("calibrateBtn").addEventListener("click", () => postAction("/calibrate", "Calibrating..."));
+    $("audioBtn").addEventListener("click", () => postAction("/toggle-audio", "Updating audio..."));
+    $("resetBtn").addEventListener("click", () => postAction("/reset-target", "Resetting target..."));
+    $("stopBtn").addEventListener("click", () => postAction("/stop", "Stopping session..."));
+
+    document.addEventListener("keydown", (event) => {
+      if (event.repeat) return;
+      const tag = event.target && event.target.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+
+      const key = event.key.toLowerCase();
+      if (key === "c") {
+        event.preventDefault();
+        postAction("/calibrate", "Calibrating...");
+      } else if (key === "m") {
+        event.preventDefault();
+        postAction("/toggle-audio", "Updating audio...");
+      } else if (key === "r") {
+        event.preventDefault();
+        postAction("/reset-target", "Resetting target...");
+      } else if (key === "q") {
+        event.preventDefault();
+        postAction("/stop", "Stopping session...");
+      }
+    });
+
+    refreshStatus();
+    setInterval(refreshStatus, 750);
+  </script>
+</body>
+</html>
+"""
+
+
+def make_web_server(monitor: PostureMonitor) -> ThreadingHTTPServer:
+    class PawStureRequestHandler(BaseHTTPRequestHandler):
+        def log_message(self, format, *args):
+            return
+
+        def _send_bytes(self, body: bytes, content_type: str, status: HTTPStatus = HTTPStatus.OK):
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _send_json(self, payload: Dict[str, object], status: HTTPStatus = HTTPStatus.OK):
+            self._send_bytes(json.dumps(payload).encode("utf-8"), "application/json", status)
+
+        def do_GET(self):
+            path = urlparse(self.path).path
+            if path == "/":
+                self._send_bytes(WEB_HTML.encode("utf-8"), "text/html; charset=utf-8")
+                return
+            if path == "/status":
+                self._send_json(monitor.status_payload())
+                return
+            if path == "/video_feed":
+                self.send_response(HTTPStatus.OK)
+                self.send_header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                while monitor._running:
+                    frame = monitor.latest_jpeg()
+                    if frame is None:
+                        time.sleep(0.1)
+                        continue
+                    try:
+                        self.wfile.write(b"--frame\r\n")
+                        self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                        self.wfile.write(f"Content-Length: {len(frame)}\r\n\r\n".encode("ascii"))
+                        self.wfile.write(frame)
+                        self.wfile.write(b"\r\n")
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+                    time.sleep(0.08)
+                return
+            self._send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
+
+        def do_POST(self):
+            path = urlparse(self.path).path
+            if path == "/calibrate":
+                ok, message = monitor.calibrate_current()
+                status = HTTPStatus.OK if ok else HTTPStatus.CONFLICT
+                self._send_json({"ok": ok, "message": message, "status": monitor.status_payload()}, status)
+                return
+            if path == "/toggle-audio":
+                self._send_json({"ok": True, "message": "", "status": monitor.toggle_audio()})
+                return
+            if path == "/reset-target":
+                self._send_json({"ok": True, "message": "Target reset.", "status": monitor.reset_target()})
+                return
+            if path == "/stop":
+                self._send_json({"ok": True, "message": "Session stopped.", "status": monitor.stop()})
+                return
+            self._send_json({"error": "Not found"}, HTTPStatus.NOT_FOUND)
+
+    return ThreadingHTTPServer((monitor.cfg.web_host, monitor.cfg.web_port), PawStureRequestHandler)
 
 
 def parse_args() -> Config:
@@ -870,6 +1435,10 @@ def parse_args() -> Config:
     p.add_argument("--imgsz", type=int, default=320)
     p.add_argument("--port", type=str, default=None)
     p.add_argument("--baud", type=int, default=115200)
+    p.add_argument("--web", action="store_true", help="Start the local browser console instead of the OpenCV window.")
+    p.add_argument("--web-host", default="127.0.0.1", help="Host for the local web console.")
+    p.add_argument("--web-port", type=int, default=8000, help="Port for the local web console.")
+    p.add_argument("--no-open", action="store_true", help="Do not automatically open the browser in web mode.")
     args = p.parse_args()
 
     return Config(
@@ -879,10 +1448,17 @@ def parse_args() -> Config:
         model_imgsz=args.imgsz,
         serial_port=args.port,
         serial_baud=args.baud,
+        web_enabled=args.web,
+        web_host=args.web_host,
+        web_port=args.web_port,
+        web_open_browser=not args.no_open,
     )
 
 
 if __name__ == "__main__":
     cfg = parse_args()
     app = PostureMonitor(cfg)
-    app.run()
+    if cfg.web_enabled:
+        app.run_web()
+    else:
+        app.run()
