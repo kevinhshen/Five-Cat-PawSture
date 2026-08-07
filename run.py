@@ -37,6 +37,9 @@ def main() -> int:
     sys.argv = [str(MAIN_SCRIPT), *args.monitor_args]
     try:
         runpy.run_path(str(MAIN_SCRIPT), run_name="__main__")
+    except KeyboardInterrupt:
+        print("\n[startup] Program stopped by user. Exiting...", flush=True)
+        sys.exit(0)
     except RuntimeError as exc:
         print(f"[startup] {exc}")
         if "Could not open camera" in str(exc):
