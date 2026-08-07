@@ -119,6 +119,7 @@ def parse_launcher_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    os.chdir(ROOT)
     args = parse_launcher_args()
     environment_exit = ensure_project_environment(args.no_venv)
     if environment_exit is not None:
