@@ -92,7 +92,6 @@ class Config:
     web_host: str = "127.0.0.1"
     web_port: int = 8000
     web_open_browser: bool = True
-    web_client_timeout_s: float = 3.0
 
     # -- YOLOv8-Pose COCO keypoint indices --
     KP_NOSE: int = 0
@@ -568,8 +567,6 @@ class PostureMonitor:
         self._last_switch_t = 0.0
         self._running = True
         self._latest_jpeg: Optional[bytes] = None
-        self._web_client_seen = False
-        self._last_web_client_t = time.time()
         self._state_lock = threading.Lock()
 
     def _extract_candidates(self, frame):
@@ -945,17 +942,6 @@ class PostureMonitor:
             self._running = False
             return self.status_payload()
 
-    def record_web_client(self):
-        with self._state_lock:
-            self._web_client_seen = True
-            self._last_web_client_t = time.time()
-
-    def web_client_timed_out(self) -> bool:
-        with self._state_lock:
-            if not self._web_client_seen:
-                return False
-            return (time.time() - self._last_web_client_t) > self.cfg.web_client_timeout_s
-
     def status_payload(self) -> Dict[str, object]:
         mode = self._active_mode or "FINDING"
         score = self._last_reading.score
@@ -997,9 +983,6 @@ class PostureMonitor:
                     time.sleep(0.5)
                     continue
                 self._process_frame(frame, show_keyboard_hints=False)
-                if self.web_client_timed_out():
-                    print("[web] Browser closed or disconnected; stopping PawSture.")
-                    self.stop()
                 time.sleep(0.01)
         finally:
             self._running = False
@@ -1461,7 +1444,6 @@ def make_web_server(monitor: PostureMonitor) -> ThreadingHTTPServer:
                 self._send_bytes(WEB_HTML.encode("utf-8"), "text/html; charset=utf-8")
                 return
             if path == "/status":
-                monitor.record_web_client()
                 self._send_json(monitor.status_payload())
                 return
             if path == "/video_feed":
