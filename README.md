@@ -37,6 +37,9 @@ To install without a prompt:
 python3 run.py --install
 ```
 
+Use this option if your terminal opens but does not let you answer the setup
+prompt.
+
 To skip the local environment and use your current Python instead:
 
 ```bash
