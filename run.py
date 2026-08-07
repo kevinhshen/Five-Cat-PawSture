@@ -2,6 +2,8 @@
 Friendly launcher for PawSture.
 
 Starts the posture monitor from the project root.
+
+Run web: python3 run.py --web
 """
 import argparse
 import os
