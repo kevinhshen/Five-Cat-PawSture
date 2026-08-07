@@ -54,8 +54,8 @@ class Config:
     front_min_shoulder_head_ratio: float = 2.2 
 
     # -- Classification thresholds for front-view posture score (0-100) --
-    neutral_score: float = 28.0
-    sad_score: float = 55.0
+    neutral_score: float = 22.0
+    sad_score: float = 42.0
 
     # -- Classification thresholds for side-view angle deviations --
     side_neutral_deviation_deg: float = 10.0
@@ -129,6 +129,7 @@ class FrontPostureMetrics:
     shoulder_slope: float
     hip_shift: float
     shoulder_width_px: float
+    nose_shift: float = 0.0
 
 
 @dataclass
@@ -232,10 +233,13 @@ def extract_front_posture_metrics(
     if eye_width_px < 8:
         return None
 
+    nose_shift = 0.0
+
     # Geometry check 1.5: Profile Face Check
     if point_visible(confs, cfg.KP_NOSE, cfg):
         nose = keypoints[cfg.KP_NOSE]
         nose_to_eye_dist = float(np.linalg.norm(nose - eye_center))
+        nose_shift = normalized_x_gap(nose, eye_center, eye_width_px)
         if eye_width_px < (nose_to_eye_dist * 0.9):
             return None
 
@@ -265,6 +269,7 @@ def extract_front_posture_metrics(
         shoulder_slope=normalized_y_gap(left_shoulder, right_shoulder, shoulder_width_px),
         hip_shift=hip_shift,
         shoulder_width_px=shoulder_width_px,
+        nose_shift=nose_shift,
     )
 
     tracking_points = {
@@ -277,6 +282,8 @@ def extract_front_posture_metrics(
         "right_eye": right_eye,
         "eye_center": eye_center,
     }
+    if point_visible(confs, cfg.KP_NOSE, cfg):
+        tracking_points["nose"] = keypoints[cfg.KP_NOSE]
     if hip_center is not None:
         tracking_points["hip_center"] = hip_center
         tracking_points["left_hip"] = keypoints[cfg.KP_L_HIP]
@@ -293,15 +300,17 @@ def score_front_posture(metrics: FrontPostureMetrics, baseline: FrontPostureMetr
     face_close_extra = max(0.0, (metrics.eye_width_px / max(baseline.eye_width_px, 1e-6)) - 1.0)
     hip_shift_extra = max(0.0, metrics.hip_shift - baseline.hip_shift)
     shoulder_slope_extra = max(0.0, metrics.shoulder_slope - baseline.shoulder_slope)
+    nose_shift_extra = max(0.0, metrics.nose_shift - baseline.nose_shift)
 
     score = (
-        eye_drop_extra * 115.0
-        + eye_tilt_extra * 85.0
-        + eye_shift_extra * 70.0
-        + face_close_extra * 65.0
-        + compression * 45.0
-        + hip_shift_extra * 30.0
-        + shoulder_slope_extra * 12.0
+        eye_drop_extra * 145.0
+        + eye_tilt_extra * 115.0
+        + eye_shift_extra * 95.0
+        + face_close_extra * 90.0
+        + compression * 80.0
+        + hip_shift_extra * 55.0
+        + shoulder_slope_extra * 25.0
+        + nose_shift_extra * 70.0
     )
     return min(score, 100.0), compression * 100.0
 
@@ -351,6 +360,37 @@ def side_state(neck_deviation: float, trunk_deviation: float, cfg: Config) -> st
     return "SAD"
 
 
+def point_distance_px(a: np.ndarray, b: np.ndarray) -> float:
+    return float(np.linalg.norm(a - b))
+
+
+def angle_from_horizontal(a: np.ndarray, b: np.ndarray) -> float:
+    vec = b - a
+    return float(np.degrees(np.arctan2(-vec[1], vec[0])))
+
+
+def segment_midpoint(a: np.ndarray, b: np.ndarray) -> Tuple[int, int]:
+    mid = midpoint(a, b).astype(int)
+    return int(mid[0]), int(mid[1])
+
+
+def draw_text_label(frame, text: str, origin: Tuple[int, int], color: Tuple[int, int, int]):
+    cv2.putText(frame, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.48, (0, 0, 0), 4)
+    cv2.putText(frame, text, origin, cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 2)
+
+
+def draw_segment_label(
+    frame,
+    text: str,
+    a: np.ndarray,
+    b: np.ndarray,
+    color: Tuple[int, int, int],
+    offset: Tuple[int, int] = (8, -8),
+):
+    mid_x, mid_y = segment_midpoint(a, b)
+    draw_text_label(frame, text, (mid_x + offset[0], mid_y + offset[1]), color)
+
+
 # --------------------------------------------------------------------------- #
 # EMA smoothing & Serial link
 # --------------------------------------------------------------------------- #
@@ -382,6 +422,7 @@ class MetricSmoother:
             "shoulder_slope": EMASmoother(alpha),
             "hip_shift": EMASmoother(alpha),
             "shoulder_width_px": EMASmoother(alpha),
+            "nose_shift": EMASmoother(alpha),
         }
 
     def update(self, metrics: FrontPostureMetrics) -> FrontPostureMetrics:
@@ -606,7 +647,7 @@ class PostureMonitor:
         score = None
         compression = None
         if self.front_baseline.calibrated and self.front_baseline.metrics is not None:
-            score, compression = score_front_posture(metrics, self.front_baseline.metrics)
+            score, compression = score_front_posture(smoothed_metrics, self.front_baseline.metrics)
             self._last_state = classify_state(score, self.cfg)
             self.serial_link.send_state(self._last_state)
         else:
@@ -644,9 +685,34 @@ class PostureMonitor:
         cv2.line(frame, left_eye, right_eye, (0, 255, 255), 3)
         cv2.line(frame, left_shoulder, right_shoulder, (255, 180, 0), 3)
         cv2.line(frame, shoulder_center, eye_center, (255, 180, 0), 3)
+
+        eye_distance = point_distance_px(points["left_eye"], points["right_eye"])
+        eye_angle = angle_from_horizontal(points["left_eye"], points["right_eye"])
+        shoulder_distance = point_distance_px(points["left_shoulder"], points["right_shoulder"])
+        shoulder_angle = angle_from_horizontal(points["left_shoulder"], points["right_shoulder"])
+        head_distance = point_distance_px(points["eye_center"], points["shoulder_center"])
+        head_angle = angle_from_vertical(points["eye_center"], points["shoulder_center"])
+
+        if "nose" in points:
+            nose = points["nose"]
+            nose_pt = tuple(nose.astype(int))
+            nose_distance = point_distance_px(points["eye_center"], nose)
+            nose_angle = angle_from_horizontal(points["eye_center"], nose)
+            cv2.line(frame, eye_center, nose_pt, (0, 160, 255), 2)
+            draw_segment_label(frame, f"{nose_distance:.0f}px, {nose_angle:+.1f} deg", points["eye_center"], nose, (0, 160, 255), (10, 18))
+
+        draw_segment_label(frame, f"{eye_distance:.0f}px, {eye_angle:+.1f} deg", points["left_eye"], points["right_eye"], (0, 255, 255), (8, -10))
+        draw_segment_label(frame, f"{shoulder_distance:.0f}px, {shoulder_angle:+.1f} deg", points["left_shoulder"], points["right_shoulder"], (255, 180, 0), (8, 18))
+        draw_segment_label(frame, f"{head_distance:.0f}px, {head_angle:+.1f} deg", points["shoulder_center"], points["eye_center"], (255, 180, 0), (10, -10))
+
         for point, color in ((left_eye, (0, 255, 255)), (right_eye, (0, 255, 255)), (eye_center, (0, 220, 220)), (left_shoulder, (255, 0, 255)), (right_shoulder, (255, 0, 255)), (shoulder_center, (255, 180, 0))):
             cv2.circle(frame, point, 7, color, -1)
             cv2.circle(frame, point, 10, (0, 0, 0), 2)
+        if "nose" in points:
+            nose_pt = tuple(points["nose"].astype(int))
+            cv2.circle(frame, nose_pt, 7, (0, 160, 255), -1)
+            cv2.circle(frame, nose_pt, 10, (0, 0, 0), 2)
+            draw_text_label(frame, "Nose", (nose_pt[0] + 10, nose_pt[1] - 10), (0, 160, 255))
         return frame
 
     def _draw_side_tracking(self, frame):
@@ -656,10 +722,18 @@ class PostureMonitor:
         ear_pt, shoulder_pt, hip_pt = tuple(ear.astype(int)), tuple(shoulder.astype(int)), tuple(hip.astype(int))
         cv2.line(frame, shoulder_pt, ear_pt, (255, 200, 0), 3)
         cv2.line(frame, hip_pt, shoulder_pt, (0, 165, 255), 3)
+
+        neck_distance = point_distance_px(ear, shoulder)
+        trunk_distance = point_distance_px(shoulder, hip)
+        neck_angle = angle_from_vertical(ear, shoulder)
+        trunk_angle = angle_from_vertical(shoulder, hip)
+        draw_segment_label(frame, f"{neck_distance:.0f}px, {neck_angle:+.1f} deg", shoulder, ear, (255, 200, 0), (10, -10))
+        draw_segment_label(frame, f"{trunk_distance:.0f}px, {trunk_angle:+.1f} deg", hip, shoulder, (0, 165, 255), (10, 18))
+
         for point, color, label in ((ear_pt, (255, 0, 0), "Ear"), (shoulder_pt, (0, 255, 0), "Shoulder"), (hip_pt, (0, 0, 255), "Hip")):
             cv2.circle(frame, point, 7, color, -1)
-            cv2.putText(frame, label, (point[0] + 10, point[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-        cv2.putText(frame, f"Tracked side: {side_name}", (10, frame.shape[0] - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230, 230, 230), 2)
+            draw_text_label(frame, label, (point[0] + 10, point[1] - 10), color)
+        draw_text_label(frame, f"Tracked side: {side_name}", (10, frame.shape[0] - 18), (230, 230, 230))
         return frame
 
     def _draw_overlay(self, frame, reading: PostureReading, state: str):
@@ -677,6 +751,7 @@ class PostureMonitor:
                 f"Eye drop: {metrics.eye_drop:.2f}" if metrics is not None else "Eye drop: --",
                 f"Eye tilt: {metrics.eye_tilt:.2f}" if metrics is not None else "Eye tilt: --",
                 f"Eye shift: {metrics.eye_shift:.2f}" if metrics is not None else "Eye shift: --",
+                f"Nose shift: {metrics.nose_shift:.2f}" if metrics is not None else "Nose shift: --",
                 f"Face distance: {metrics.eye_width_px:.0f}px" if metrics is not None else "Face distance: --",
                 f"Shoulder slope: {metrics.shoulder_slope:.2f}" if metrics is not None else "Shoulder slope: --",
                 f"Neck compression: {reading.compression_pct:.0f}%" if reading.compression_pct is not None else "Neck compression: --",
