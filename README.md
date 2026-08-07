@@ -27,23 +27,10 @@ The browser should open automatically. If it does not, open:
 http://127.0.0.1:8000
 ```
 
-The launcher checks for the required packages and offers to install anything
-missing automatically. It also uses the local `.venv` environment automatically,
-so you do not need to activate it first.
-
-To install without a prompt:
+If Python says a package is missing, install the project requirements manually:
 
 ```bash
-python3 run.py --install
-```
-
-Use this option if your terminal opens but does not let you answer the setup
-prompt.
-
-To skip the local environment and use your current Python instead:
-
-```bash
-python3 run.py --no-venv
+python3 -m pip install -r requirements.txt
 ```
 
 You can still pass monitor options after the launcher option, for example:
