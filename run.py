@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parent
 MAIN_SCRIPT = ROOT / "Main Thing" / "main.py"
 REQUIREMENTS = ROOT / "requirements.txt"
 MPL_CACHE = ROOT / ".cache" / "matplotlib"
+VENV_DIR = ROOT / ".venv"
 
 REQUIRED_IMPORTS = {
     "cv2": "opencv-python",
@@ -24,6 +25,35 @@ REQUIRED_IMPORTS = {
     "serial": "pyserial",
     "ultralytics": "ultralytics",
 }
+
+
+def in_virtual_environment() -> bool:
+    return sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+
+
+def venv_python_path() -> Path:
+    if os.name == "nt":
+        return VENV_DIR / "Scripts" / "python.exe"
+    return VENV_DIR / "bin" / "python"
+
+
+def ensure_project_environment(skip_venv: bool) -> int | None:
+    if skip_venv or in_virtual_environment():
+        return None
+
+    python_path = venv_python_path()
+    if not python_path.exists():
+        print("[setup] Creating local Python environment in .venv...")
+        try:
+            subprocess.check_call([sys.executable, "-m", "venv", str(VENV_DIR)])
+        except subprocess.CalledProcessError as exc:
+            print(f"[setup] Could not create .venv; venv exited with {exc.returncode}.")
+            print("[setup] Continuing with your current Python installation.")
+            return None
+
+    print("[setup] Using local Python environment: .venv", flush=True)
+    os.execv(str(python_path), [str(python_path), str(Path(__file__).resolve()), *sys.argv[1:]])
+    return 0
 
 
 def missing_packages() -> list[str]:
@@ -78,6 +108,11 @@ def parse_launcher_args() -> argparse.Namespace:
         action="store_true",
         help="Only report missing packages; do not install them.",
     )
+    parser.add_argument(
+        "--no-venv",
+        action="store_true",
+        help="Use the current Python environment instead of the local .venv.",
+    )
     args, monitor_args = parser.parse_known_args()
     args.monitor_args = monitor_args
     return args
@@ -85,6 +120,10 @@ def parse_launcher_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_launcher_args()
+    environment_exit = ensure_project_environment(args.no_venv)
+    if environment_exit is not None:
+        return environment_exit
+
     packages = missing_packages()
 
     if packages:
