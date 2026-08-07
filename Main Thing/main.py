@@ -62,7 +62,7 @@ class Config:
     front_max_eye_tilt_ratio: float = 0.8  # Increased to allow head tilting
     front_min_shoulder_head_ratio: float = 2.2 
 
-    # -- Classification thresholds for front-view posture score (0-100) --
+    # -- Classification thresholds for front-view posture strain score (0-100) --
     neutral_score: float = 22.0
     sad_score: float = 42.0
 
@@ -326,7 +326,7 @@ def score_front_posture(metrics: FrontPostureMetrics, baseline: FrontPostureMetr
     shoulder_slope_extra = max(0.0, metrics.shoulder_slope - baseline.shoulder_slope)
     nose_shift_extra = max(0.0, metrics.nose_shift - baseline.nose_shift)
 
-    score = (
+    strain_score = (
         eye_drop_extra * 145.0
         + eye_tilt_extra * 115.0
         + eye_shift_extra * 95.0
@@ -336,7 +336,8 @@ def score_front_posture(metrics: FrontPostureMetrics, baseline: FrontPostureMetr
         + shoulder_slope_extra * 25.0
         + nose_shift_extra * 70.0
     )
-    return min(score, 100.0), compression * 100.0
+    posture_score = 100.0 - min(strain_score, 100.0)
+    return posture_score, compression * 100.0
 
 
 def average_front_metrics(samples) -> FrontPostureMetrics:
@@ -354,9 +355,9 @@ def average_front_metrics(samples) -> FrontPostureMetrics:
 
 
 def classify_state(score: float, cfg: Config) -> str:
-    if score <= cfg.neutral_score:
+    if score >= 100.0 - cfg.neutral_score:
         return "HAPPY"
-    if score <= cfg.sad_score:
+    if score >= 100.0 - cfg.sad_score:
         return "NEUTRAL"
     return "SAD"
 
@@ -812,7 +813,7 @@ class PostureMonitor:
         metrics = reading.metrics
         if self._active_mode == "FRONT":
             lines = [
-                f"Mode: FRONT (Target #{self.target_track_id})",
+                "Mode: FRONT",
                 f"State: {state}",
                 f"Posture score: {reading.score:.0f}/100" if reading.score is not None else "Posture score: --",
                 f"Eye drop: {metrics.eye_drop:.2f}" if metrics is not None else "Eye drop: --",
@@ -831,7 +832,7 @@ class PostureMonitor:
         elif self._active_mode == "SIDE":
             neck_angle, trunk_angle = self._last_side_angles
             lines = [
-                f"Mode: SIDE (Target #{self.target_track_id})",
+                "Mode: SIDE",
                 f"State: {state}",
                 f"Neck angle: {neck_angle:.1f} deg" if neck_angle is not None else "Neck angle: --",
                 f"Trunk angle: {trunk_angle:.1f} deg" if trunk_angle is not None else "Trunk angle: --",
@@ -910,12 +911,12 @@ class PostureMonitor:
             active_mode = self._active_mode
             if active_mode == "FRONT" and self._last_reading.metrics is not None:
                 self._calibrate_front(self._last_reading.metrics)
-                return True, f"Front baseline set for target #{self.target_track_id}"
+                return True, "Front baseline set."
             if active_mode == "SIDE":
                 neck_angle, trunk_angle = self._last_side_angles
                 if neck_angle is not None and trunk_angle is not None:
                     self._calibrate_side(neck_angle, trunk_angle)
-                    return True, f"Side baseline set for target #{self.target_track_id}"
+                    return True, "Side baseline set."
             return False, "Wait for front or side tracking before calibrating."
 
     def toggle_audio(self) -> Dict[str, object]:
@@ -1311,7 +1312,6 @@ WEB_HTML = """<!doctype html>
 
         <section class="panel stats">
           <div class="row"><span>Mode</span><strong id="modeValue">Finding</strong></div>
-          <div class="row"><span>Target</span><strong id="targetValue">--</strong></div>
           <div class="row"><span>Score</span><strong id="scoreValue">--</strong></div>
           <div class="row"><span>Neck angle</span><strong id="neckValue">--</strong></div>
           <div class="row"><span>Trunk angle</span><strong id="trunkValue">--</strong></div>
@@ -1352,7 +1352,6 @@ WEB_HTML = """<!doctype html>
       stateValue.classList.toggle("sad", data.state === "SAD");
 
       $("modeValue").textContent = titleCase(data.mode);
-      $("targetValue").textContent = data.target === null || data.target === undefined ? "--" : `#${data.target}`;
       $("scoreValue").textContent = formatNumber(data.score, "/100");
       $("neckValue").textContent = formatNumber(data.neckAngle, " deg");
       $("trunkValue").textContent = formatNumber(data.trunkAngle, " deg");
@@ -1389,10 +1388,20 @@ WEB_HTML = """<!doctype html>
       }
     }
 
+    function closeBrowserWindow() {
+      window.open("", "_self");
+      window.close();
+    }
+
+    async function stopSession() {
+      await postAction("/stop", "Stopping session...");
+      setTimeout(closeBrowserWindow, 150);
+    }
+
     $("calibrateBtn").addEventListener("click", () => postAction("/calibrate", "Calibrating..."));
     $("audioBtn").addEventListener("click", () => postAction("/toggle-audio", "Updating audio..."));
     $("resetBtn").addEventListener("click", () => postAction("/reset-target", "Resetting target..."));
-    $("stopBtn").addEventListener("click", () => postAction("/stop", "Stopping session..."));
+    $("stopBtn").addEventListener("click", stopSession);
 
     document.addEventListener("keydown", (event) => {
       if (event.repeat) return;
@@ -1411,7 +1420,7 @@ WEB_HTML = """<!doctype html>
         postAction("/reset-target", "Resetting target...");
       } else if (key === "q") {
         event.preventDefault();
-        postAction("/stop", "Stopping session...");
+        stopSession();
       }
     });
 
