@@ -54,3 +54,13 @@ The web console supports the same monitor options:
 ```bash
 python3 run.py --web --camera 1 --port /dev/cu.usbmodem1101
 ```
+
+Front and side baselines are captured automatically after a few good tracking
+frames in each view. Use the Calibrate/Recalibrate button, or press `C`, only
+when you want to override the automatic baseline.
+
+To use the older manual calibration flow:
+
+```bash
+python3 run.py --manual-calibration
+```

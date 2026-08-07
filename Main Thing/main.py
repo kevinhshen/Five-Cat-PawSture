@@ -53,6 +53,10 @@ class Config:
     # -- Smoothing --
     ema_alpha: float = 0.3
 
+    # -- Baseline calibration --
+    auto_calibrate: bool = True
+    auto_calibrate_samples: int = 6
+
     # -- Front-view geometry checks --
     front_min_eye_shoulder_ratio: float = 0.16
     front_max_eye_tilt_ratio: float = 0.8  # Increased to allow head tilting
@@ -159,6 +163,10 @@ class Baseline:
         self.metrics = metrics
         self.calibrated = True
 
+    def clear(self):
+        self.metrics = None
+        self.calibrated = False
+
 
 @dataclass
 class SideBaseline:
@@ -170,6 +178,11 @@ class SideBaseline:
         self.neck_angle = neck_angle
         self.trunk_angle = trunk_angle
         self.calibrated = True
+
+    def clear(self):
+        self.neck_angle = None
+        self.trunk_angle = None
+        self.calibrated = False
 
 
 def point_visible(confs: np.ndarray, idx: int, cfg: Config) -> bool:
@@ -324,6 +337,20 @@ def score_front_posture(metrics: FrontPostureMetrics, baseline: FrontPostureMetr
         + nose_shift_extra * 70.0
     )
     return min(score, 100.0), compression * 100.0
+
+
+def average_front_metrics(samples) -> FrontPostureMetrics:
+    return FrontPostureMetrics(
+        eye_width_px=float(np.mean([sample.eye_width_px for sample in samples])),
+        eye_drop=float(np.mean([sample.eye_drop for sample in samples])),
+        eye_tilt=float(np.mean([sample.eye_tilt for sample in samples])),
+        eye_shift=float(np.mean([sample.eye_shift for sample in samples])),
+        neck_height=float(np.mean([sample.neck_height for sample in samples])),
+        shoulder_slope=float(np.mean([sample.shoulder_slope for sample in samples])),
+        hip_shift=float(np.mean([sample.hip_shift for sample in samples])),
+        shoulder_width_px=float(np.mean([sample.shoulder_width_px for sample in samples])),
+        nose_shift=float(np.mean([sample.nose_shift for sample in samples])),
+    )
 
 
 def classify_state(score: float, cfg: Config) -> str:
@@ -519,6 +546,8 @@ class PostureMonitor:
         self.side_neck_smoother = EMASmoother(cfg.ema_alpha)
         self.side_trunk_smoother = EMASmoother(cfg.ema_alpha)
         self.side_baseline = SideBaseline()
+        self._front_calibration_samples = deque(maxlen=cfg.auto_calibrate_samples)
+        self._side_calibration_samples = deque(maxlen=cfg.auto_calibrate_samples)
         self.serial_link = SerialLink(cfg.serial_port, cfg.serial_baud, cfg.send_min_interval_s)
 
         self._last_sample_t = 0.0
@@ -644,20 +673,43 @@ class PostureMonitor:
 
     def _calibrate_front(self, metrics: FrontPostureMetrics):
         self.front_baseline.set(metrics)
+        self._front_calibration_samples.clear()
         self.front_metric_smoother.reset()
         print(f"[calibration] Front baseline set -> eye width: {metrics.eye_width_px:.1f}px")
 
     def _calibrate_side(self, neck_angle: float, trunk_angle: float):
         self.side_baseline.set(neck_angle, trunk_angle)
+        self._side_calibration_samples.clear()
         self.side_neck_smoother.reset()
         self.side_trunk_smoother.reset()
         print(f"[calibration] Side baseline set -> neck: {neck_angle:.1f} deg, trunk: {trunk_angle:.1f} deg")
+
+    def _maybe_auto_calibrate_front(self, metrics: FrontPostureMetrics):
+        if not self.cfg.auto_calibrate or self.front_baseline.calibrated:
+            return
+        self._front_calibration_samples.append(metrics)
+        if len(self._front_calibration_samples) < self.cfg.auto_calibrate_samples:
+            return
+        self._calibrate_front(average_front_metrics(self._front_calibration_samples))
+        print("[calibration] Front baseline auto-captured.")
+
+    def _maybe_auto_calibrate_side(self, neck_angle: float, trunk_angle: float):
+        if not self.cfg.auto_calibrate or self.side_baseline.calibrated:
+            return
+        self._side_calibration_samples.append((neck_angle, trunk_angle))
+        if len(self._side_calibration_samples) < self.cfg.auto_calibrate_samples:
+            return
+        neck_avg = float(np.mean([sample[0] for sample in self._side_calibration_samples]))
+        trunk_avg = float(np.mean([sample[1] for sample in self._side_calibration_samples]))
+        self._calibrate_side(neck_avg, trunk_avg)
+        print("[calibration] Side baseline auto-captured.")
 
     def _update_front(self, extracted):
         metrics, tracking_points = extracted
         self._last_tracking_points = tracking_points
         self._last_side_points = None
         smoothed_metrics = self.front_metric_smoother.update(metrics)
+        self._maybe_auto_calibrate_front(smoothed_metrics)
         score = None
         compression = None
         if self.front_baseline.calibrated and self.front_baseline.metrics is not None:
@@ -679,6 +731,7 @@ class PostureMonitor:
         self._last_tracking_points = None
         self._last_reading = PostureReading(metrics=None)
         self._last_side_angles = (neck_smoothed, trunk_smoothed)
+        self._maybe_auto_calibrate_side(neck_smoothed, trunk_smoothed)
         if self.side_baseline.calibrated:
             neck_dev = neck_smoothed - self.side_baseline.neck_angle
             trunk_dev = trunk_smoothed - self.side_baseline.trunk_angle
@@ -770,7 +823,9 @@ class PostureMonitor:
                 f"Shoulder slope: {metrics.shoulder_slope:.2f}" if metrics is not None else "Shoulder slope: --",
                 f"Neck compression: {reading.compression_pct:.0f}%" if reading.compression_pct is not None else "Neck compression: --",
                 "Front baseline: SET" if self.front_baseline.calibrated else (
-                    "Front baseline: NOT SET (press 'c')" if show_keyboard_hints else "Front baseline: NOT SET"
+                    "Front baseline: AUTO..." if self.cfg.auto_calibrate else (
+                        "Front baseline: NOT SET (press 'c')" if show_keyboard_hints else "Front baseline: NOT SET"
+                    )
                 ),
             ]
         elif self._active_mode == "SIDE":
@@ -781,7 +836,9 @@ class PostureMonitor:
                 f"Neck angle: {neck_angle:.1f} deg" if neck_angle is not None else "Neck angle: --",
                 f"Trunk angle: {trunk_angle:.1f} deg" if trunk_angle is not None else "Trunk angle: --",
                 "Side baseline: SET" if self.side_baseline.calibrated else (
-                    "Side baseline: NOT SET (press 'c')" if show_keyboard_hints else "Side baseline: NOT SET"
+                    "Side baseline: AUTO..." if self.cfg.auto_calibrate else (
+                        "Side baseline: NOT SET (press 'c')" if show_keyboard_hints else "Side baseline: NOT SET"
+                    )
                 ),
             ]
         else:
@@ -870,10 +927,14 @@ class PostureMonitor:
     def reset_target(self) -> Dict[str, object]:
         with self._state_lock:
             self.target_track_id = None
+            self.front_baseline.clear()
+            self.side_baseline.clear()
+            self._front_calibration_samples.clear()
+            self._side_calibration_samples.clear()
             self.front_metric_smoother.reset()
             self.side_neck_smoother.reset()
             self.side_trunk_smoother.reset()
-            print("[tracking] Target reset; the centered student will be selected next.")
+            print("[tracking] Target and baselines reset; the centered student will be selected next.")
             return self.status_payload()
 
     def stop(self) -> Dict[str, object]:
@@ -891,6 +952,7 @@ class PostureMonitor:
             "mode": mode,
             "target": self.target_track_id,
             "audioOn": self.audio_on,
+            "autoCalibrate": self.cfg.auto_calibrate,
             "frontBaseline": self.front_baseline.calibrated,
             "sideBaseline": self.side_baseline.calibrated,
             "serialConnected": bool(self.serial_link.enabled and self.serial_link.conn is not None),
@@ -931,7 +993,7 @@ class PostureMonitor:
 
     def run(self):
         print("Automatic front/side posture mode with student targeting.")
-        print("Press 'c' to calibrate & lock active target, 'm' to mute, 'q' to quit.")
+        print("Baselines auto-capture for each view; press 'c' to recalibrate active view, 'm' to mute, 'q' to quit.")
         try:
             while True:
                 ok, frame = self.cap.read()
@@ -1258,7 +1320,7 @@ WEB_HTML = """<!doctype html>
         </section>
 
         <section class="panel controls">
-          <button id="calibrateBtn">Calibrate [C]</button>
+          <button id="calibrateBtn">Recalibrate [C]</button>
           <button id="audioBtn" class="secondary">Mute Alerts [M]</button>
           <button id="resetBtn" class="secondary">Reset Target [R]</button>
           <button id="stopBtn" class="danger">Stop Session [Q]</button>
@@ -1294,8 +1356,8 @@ WEB_HTML = """<!doctype html>
       $("scoreValue").textContent = formatNumber(data.score, "/100");
       $("neckValue").textContent = formatNumber(data.neckAngle, " deg");
       $("trunkValue").textContent = formatNumber(data.trunkAngle, " deg");
-      $("frontValue").textContent = data.frontBaseline ? "Set" : "Not set";
-      $("sideValue").textContent = data.sideBaseline ? "Set" : "Not set";
+      $("frontValue").textContent = data.frontBaseline ? "Set" : (data.autoCalibrate ? "Auto..." : "Not set");
+      $("sideValue").textContent = data.sideBaseline ? "Set" : (data.autoCalibrate ? "Auto..." : "Not set");
       $("audioText").textContent = data.audioOn ? "Audio on" : "Audio muted";
       $("audioBtn").textContent = data.audioOn ? "Mute Alerts [M]" : "Unmute Alerts [M]";
 
@@ -1439,6 +1501,7 @@ def parse_args() -> Config:
     p.add_argument("--web-host", default="127.0.0.1", help="Host for the local web console.")
     p.add_argument("--web-port", type=int, default=8000, help="Port for the local web console.")
     p.add_argument("--no-open", action="store_true", help="Do not automatically open the browser in web mode.")
+    p.add_argument("--manual-calibration", action="store_true", help="Require pressing C/button to set front and side baselines.")
     args = p.parse_args()
 
     return Config(
@@ -1452,6 +1515,7 @@ def parse_args() -> Config:
         web_host=args.web_host,
         web_port=args.web_port,
         web_open_browser=not args.no_open,
+        auto_calibrate=not args.manual_calibration,
     )
 
 
