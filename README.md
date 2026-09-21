@@ -76,7 +76,7 @@ On Windows, the port will usually look like `COM3` or `COM4`. PawSture can also 
 ## Requirements
 
 - Python 3
-- A webcam
+- *A webcam*
 - The packages listed in `requirements.txt`
 - Optional: the Arduino and OLED hardware described above
 
